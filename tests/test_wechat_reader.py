@@ -109,7 +109,7 @@ def test_live_batch_updates_only_matching_rows(monkeypatch, desktop_app):
     assert calls == [(payload, 1)]
     assert [r.actual_table for r in app.results] == ['C6', 'C6']
     assert all(r.live_status == '已读取' and r.live_evidence == 'evidence.png' for r in app.results)
-    assert app.results[0].table_check == '不一致'  # No silent zero-padding assumptions.
+    assert app.results[0].table_check == '一致'
     assert app.results[1].table_check == '一致'
 
 

@@ -12,6 +12,11 @@ def normalize_label(value):
     return unicodedata.normalize('NFKC', value).strip().upper()
 
 
+def comparison_key(value):
+    """Case-insensitive table identity; keep raw display values untouched."""
+    return re.sub(r'[0-9]+', lambda m: m[0].lstrip('0') or '0', normalize_label(value))
+
+
 def heading_label(text):
     value = normalize_label(text)
     if any(word in value for word in ('密码', '账号', '帐号', 'WIFI', 'WIF1', 'W1FI', 'W1F1')):
@@ -65,9 +70,9 @@ def url_table_info(text):
         return '', ''
     internal_id = next((params[k][0] for k in ('dId', 'tableId', 'deskId', 'table_id') if k in params), '')
     # Only explicitly named, unambiguous table-name parameters qualify.
-    names = {normalize_label(v) for k in ('tableName', 'deskName', 'table_name', 'desk_name')
+    names = {comparison_key(v): v.strip() for k in ('tableName', 'deskName', 'table_name', 'desk_name')
              for v in params.get(k, []) if v.strip()}
-    return internal_id, next(iter(names)) if len(names) == 1 else ''
+    return internal_id, next(iter(names.values())) if len(names) == 1 else ''
 
 
 def apply_reference(row, reference, evidence='独立对照清单'):
@@ -90,7 +95,7 @@ def compare_table(row):
         row.table_check = '待核实：缺少实际台号'
     elif not row.printed_table:
         row.table_check = '待核实：未读到印刷台号'
-    elif normalize_label(row.printed_table) == normalize_label(row.actual_table):
+    elif comparison_key(row.printed_table) == comparison_key(row.actual_table):
         row.table_check = '一致'
     else:
         row.table_check = '不一致'
@@ -106,7 +111,7 @@ def load_reference(path):
             url, name = (row.get('url') or '').strip(), (row.get('actual_table') or '').strip()
             if not url or not name:
                 raise ValueError(f'第 {index} 行缺少网址或实际台号')
-            if url in reference and normalize_label(reference[url]) != normalize_label(name):
+            if url in reference and comparison_key(reference[url]) != comparison_key(name):
                 raise ValueError(f'第 {index} 行同一个网址对应多个台号')
             reference[url] = name
     if not reference:
@@ -134,7 +139,7 @@ def load_reference_folder(folder):
         text, name = rows[0].text.strip(), path.stem.strip()
         if not text or not name:
             raise ValueError(f'{path.name}：缺少内容或台号文件名')
-        if text in reference and normalize_label(reference[text]) != normalize_label(name):
+        if text in reference and comparison_key(reference[text]) != comparison_key(name):
             raise ValueError(f'原码冲突：同一个码同时命名为 {reference[text]} 和 {name}，请先核实后台原始文件。')
         reference[text] = name
     if not reference:

@@ -3,6 +3,20 @@ from scanner import Result
 from table_audit import label_for, apply_reference, load_reference
 
 
+@pytest.mark.parametrize('printed,actual,expected', [
+    ('A01', 'A1', '一致'), ('A02', 'a2', '一致'), ('a01', 'A001', '一致'),
+    ('C06', 'c6', '一致'), ('A00', 'a0', '一致'), ('Ａ０１', 'a1', '一致'),
+    ('A01', 'A2', '不一致'), ('A01', 'B01', '不一致'),
+    ('A-01', 'A01', '不一致'), ('A01', 'A10', '不一致'),
+])
+def test_comparison_ignores_padding_and_case_without_changing_original(printed, actual, expected):
+    from table_audit import compare_table
+    row = Result('x.png', 1, '已识别', printed_table=printed, actual_table=actual)
+    compare_table(row)
+    assert row.table_check == expected
+    assert row.printed_table == printed and row.actual_table == actual
+
+
 def test_wifi_text_not_mistaken_for_orphan_table():
     from table_audit import heading_label
     assert heading_label('A01扫码点餐') == 'A01'

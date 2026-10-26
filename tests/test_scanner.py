@@ -5,7 +5,8 @@ from scanner import scan_file, export_results
 
 
 def barcode(text, fmt=zxingcpp.BarcodeFormat.QRCode):
-    return Image.fromarray(zxingcpp.write_barcode(fmt, text, width=360, height=180))
+    code = zxingcpp.create_barcode(text, fmt)
+    return Image.fromarray(zxingcpp.write_barcode_to_image(code, scale=4, add_quiet_zones=True))
 
 
 def test_multiple_symbols_and_blank(tmp_path):
@@ -41,3 +42,14 @@ def test_exports(tmp_path):
     path = tmp_path / 'results.json'
     export_results(path, rows)
     assert '中文.png' in path.read_text(encoding='utf-8')
+
+
+def test_real_multipage_pdf(tmp_path):
+    path = tmp_path / 'document.pdf'
+    first = Image.new('RGB', (800, 600), 'white')
+    first.paste(barcode('pdf-page-one'), (100, 100))
+    second = Image.new('RGB', (800, 600), 'white')
+    second.paste(barcode('PDF-CODE128', zxingcpp.BarcodeFormat.Code128), (100, 100))
+    first.save(path, 'PDF', save_all=True, append_images=[second], resolution=150)
+    pages = list(scan_file(path))
+    assert [(p[0].page, p[0].text) for p in pages] == [(1, 'pdf-page-one'), (2, 'PDF-CODE128')]

@@ -41,12 +41,18 @@ def scan_file(path, cancel=None, scale=3):
                     if cancel.is_set():
                         return
                     page_num = index + 1
-                    with doc[index] as page:
+                    page = doc[index]
+                    try:
                         # Bound the raster to avoid excessive memory on large sheets.
                         factor = min(scale, 6000 / max(page.get_size()))
-                        with page.render(scale=factor) as bitmap:
+                        bitmap = page.render(scale=factor)
+                        try:
                             with bitmap.to_pil() as image:
                                 yield decode(image, path, page_num)
+                        finally:
+                            bitmap.close()
+                    finally:
+                        page.close()
         else:
             with Image.open(path) as image:
                 for page_num, frame in enumerate(ImageSequence.Iterator(image), 1):

@@ -63,6 +63,17 @@ class App(tk.Tk):
         body.add(right, weight=4)
         self.file_count = tk.StringVar(value='待扫描文件 · 0')
         ttk.Label(left, textvariable=self.file_count, font=('Microsoft YaHei UI', 12, 'bold')).pack(anchor='w', pady=(0, 10))
+        files_frame = ttk.Frame(left)
+        files_frame.pack(fill='both', expand=True, pady=(0, 8))
+        self.file_list = tk.Listbox(files_frame, width=30, height=8, borderwidth=0, font=('Microsoft YaHei UI', 10), selectmode='extended', exportselection=False)
+        file_scroll = ttk.Scrollbar(files_frame, command=self.file_list.yview)
+        self.file_list.configure(yscrollcommand=file_scroll.set)
+        self.file_list.pack(side='left', fill='both', expand=True)
+        file_scroll.pack(side='right', fill='y')
+        self.file_list.bind('<Delete>', self.remove_files)
+        self.file_list.bind('<<ListboxSelect>>', self.show_file_preview)
+        self.file_path = tk.StringVar(value='添加后会显示文件名、路径和预览')
+        ttk.Label(left, textvariable=self.file_path, wraplength=245).pack(anchor='w', pady=(0, 10))
         self.audit_mode = tk.BooleanVar(value=True)
         self.audit_toggle = ttk.Checkbutton(left, text='识别码上方的印刷台号', variable=self.audit_mode)
         self.audit_toggle.pack(anchor='w', pady=(0, 8))
@@ -78,11 +89,21 @@ class App(tk.Tk):
             self.reference_label.set(f'已记住 {len(self.reference)} 个实际台号')
         ttk.Label(left, textvariable=self.reference_label, wraplength=240).pack(anchor='w', pady=(0, 8))
         ttk.Label(left, text='微信实读（试验）：\n点餐页文字可尝试后台读取。\n需要点击时仍需微信在前台。\n切换软件会暂停，保留队列；\n回到微信或点「继续读取」可恢复。\nF8 停止整批。', wraplength=245, foreground='#315bdf').pack(anchor='w', pady=(0, 8))
-        self.file_list = tk.Listbox(left, width=28, height=8, borderwidth=0, font=('Microsoft YaHei UI', 10), selectmode='extended')
-        self.file_list.pack(fill='both', expand=True)
-        self.file_list.bind('<Delete>', self.remove_files)
         ttk.Label(left, text='选中文件按 Delete 移除\n文件夹将递归导入；支持多页 TIFF', foreground='#667085').pack(anchor='w', pady=10)
-        filters = ttk.Frame(right)
+        self.content_tabs = ttk.Notebook(right)
+        self.content_tabs.pack(fill='both', expand=True)
+        self.preview_tab = ttk.Frame(self.content_tabs, padding=10)
+        self.results_tab = ttk.Frame(self.content_tabs)
+        self.content_tabs.add(self.preview_tab, text='已添加文件预览')
+        self.content_tabs.add(self.results_tab, text='扫码核对结果')
+        self.preview_info = tk.StringVar(value='尚未添加文件')
+        ttk.Label(self.preview_tab, textvariable=self.preview_info, wraplength=850).pack(anchor='w', pady=(0, 10))
+        self.preview_canvas = tk.Canvas(self.preview_tab, background='#e7ebf2', highlightthickness=0)
+        self.preview_canvas.pack(fill='both', expand=True)
+        self.preview_canvas.bind('<Configure>', lambda _: self.render_file_preview())
+        self.preview_image = None
+        self.preview_photo = None
+        filters = ttk.Frame(self.results_tab)
         filters.pack(fill='x', pady=(0, 10))
         ttk.Label(filters, text='识别结果', font=('Microsoft YaHei UI', 12, 'bold')).pack(side='left')
         self.query = tk.StringVar()
@@ -91,7 +112,7 @@ class App(tk.Tk):
         self.only_codes = tk.BooleanVar()
         ttk.Checkbutton(filters, text='仅已识别', variable=self.only_codes, command=self.refresh).pack(side='right', padx=12)
         self.query.trace_add('write', lambda *_: self.refresh())
-        table = ttk.Frame(right)
+        table = ttk.Frame(self.results_tab)
         table.pack(fill='both', expand=True)
         cols = ('source', 'page', 'printed_table', 'actual_table', 'table_check', 'live_status', 'text', 'table_id', 'status', 'format')
         self.table = ttk.Treeview(table, columns=cols, height=8, show='headings', selectmode='extended')
@@ -113,9 +134,9 @@ class App(tk.Tk):
         self.table.tag_configure('mismatch', background='#ffe4e4', foreground='#9b1c1c')
         self.table.tag_configure('pending', background='#fff5d6')
         self.table.tag_configure('match', background='#e5f6eb')
-        self.detail = tk.Text(right, height=4, wrap='word', font=('Microsoft YaHei UI', 10), relief='flat', state='disabled')
+        self.detail = tk.Text(self.results_tab, height=4, wrap='word', font=('Microsoft YaHei UI', 10), relief='flat', state='disabled')
         self.detail.pack(fill='x', pady=(10, 0))
-        actions = ttk.Frame(right)
+        actions = ttk.Frame(self.results_tab)
         actions.pack(fill='x', pady=(10, 0))
         ttk.Button(actions, text='复制选中内容', command=self.copy).pack(side='left')
         self.open_button = ttk.Button(actions, text='打开网页', command=self.open_webpage, state='disabled')
@@ -135,13 +156,52 @@ class App(tk.Tk):
 
     def add(self, paths):
         known = {str(p).casefold() for p in self.files}
+        added = 0
         for path in paths:
             path = Path(path).resolve()
-            if path.suffix.lower() in SUPPORTED and str(path).casefold() not in known:
+            if path.is_file() and path.suffix.lower() in SUPPORTED and str(path).casefold() not in known:
                 self.files.append(path)
                 known.add(str(path).casefold())
                 self.file_list.insert('end', path.name)
+                added += 1
         self.file_count.set(f'待扫描文件 · {len(self.files)}')
+        if self.files:
+            self.file_list.selection_clear(0, 'end')
+            self.file_list.selection_set(len(self.files) - 1)
+            self.file_list.see('end')
+            self.show_file_preview()
+            self.content_tabs.select(self.preview_tab)
+        self.status.set(f'已添加 {added} 个文件 · 当前共 {len(self.files)} 个 · 点击文件名可预览')
+
+    def show_file_preview(self, _=None):
+        selected = self.file_list.curselection()
+        self.preview_image = None
+        if selected and selected[0] < len(self.files):
+            path = self.files[selected[0]]
+            self.file_path.set(str(path))
+            try:
+                from file_preview import load_preview
+                self.preview_image, description = load_preview(path)
+                self.preview_info.set(f'{path.name}\n{description} · {path.stat().st_size / 1024:,.1f} KB\n{path}')
+            except Exception as exc:
+                self.preview_info.set(f'已添加：{path.name}\n预览失败：{exc}')
+        else:
+            self.file_path.set('尚未选择文件')
+            self.preview_info.set('选择左侧文件可查看预览')
+        self.render_file_preview()
+
+    def render_file_preview(self):
+        from PIL import ImageTk
+        self.preview_canvas.delete('all')
+        width, height = max(300, self.preview_canvas.winfo_width()), max(220, self.preview_canvas.winfo_height())
+        if self.preview_image is None:
+            self.preview_canvas.create_text(width / 2, height / 2, text='添加图片或 PDF 后，这里会显示预览', fill='#667085')
+            self.preview_photo = None
+            return
+        image = self.preview_image.copy()
+        image.thumbnail((width - 24, height - 24))
+        self.preview_photo = ImageTk.PhotoImage(image, master=self)
+        self.preview_canvas.create_image(width / 2, height / 2, image=self.preview_photo)
 
     def add_files(self):
         self.add(filedialog.askopenfilenames(filetypes=[('图片与 PDF', ' '.join('*' + ext for ext in sorted(SUPPORTED))), ('所有文件', '*.*')]))
@@ -179,12 +239,16 @@ class App(tk.Tk):
             del self.files[i]
             self.file_list.delete(i)
         self.file_count.set(f'待扫描文件 · {len(self.files)}')
+        if self.files:
+            self.file_list.selection_set(0)
+        self.show_file_preview()
 
     def clear(self):
         self.files.clear()
         self.results.clear()
         self.file_list.delete(0, 'end')
         self.file_count.set('待扫描文件 · 0')
+        self.show_file_preview()
         self.refresh()
         self.progress['value'] = 0
         self.status.set('已清空')
@@ -193,6 +257,7 @@ class App(tk.Tk):
         if self.running or not self.files:
             return
         self.running = True
+        self.content_tabs.select(self.results_tab)
         self.audit_enabled = self.audit_mode.get()
         self.cancel.clear()
         self.results.clear()

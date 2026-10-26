@@ -4,10 +4,10 @@ from scanner import Result
 from test_scanner import barcode
 
 
-def test_desktop_workflow(tmp_path):
+def test_desktop_workflow(tmp_path, desktop_app):
     path = tmp_path / '中文.png'
     barcode('desktop-test').save(path)
-    app = App()
+    app = desktop_app
     try:
         app.withdraw()
         app.add([path, path])
@@ -32,4 +32,4 @@ def test_desktop_workflow(tmp_path):
         app.clear()
         assert not app.files and not app.results
     finally:
-        app.destroy()
+        app.clear()

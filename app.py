@@ -2,10 +2,12 @@
 from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread, Event
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from scanner import SUPPORTED, scan_file, export_results
+from links import web_url
 
 
 class App(tk.Tk):
@@ -79,11 +81,17 @@ class App(tk.Tk):
         table.columnconfigure(0, weight=1)
         self.table.bind('<<TreeviewSelect>>', self.details)
         self.table.bind('<Control-c>', lambda _: self.copy())
+        self.table.bind('<Double-1>', self.open_clicked_webpage)
+        self.table.bind('<Return>', lambda _: self.open_webpage())
         self.detail = tk.Text(right, height=4, wrap='word', font=('Microsoft YaHei UI', 10), relief='flat', state='disabled')
         self.detail.pack(fill='x', pady=(10, 0))
         actions = ttk.Frame(right)
         actions.pack(fill='x', pady=(10, 0))
         ttk.Button(actions, text='复制选中内容', command=self.copy).pack(side='left')
+        self.open_button = ttk.Button(actions, text='打开网页', command=self.open_webpage, state='disabled')
+        self.open_button.pack(side='left', padx=8)
+        self.auto_open = tk.BooleanVar(value=True)
+        ttk.Checkbutton(actions, text='扫描后打开首个网页', variable=self.auto_open).pack(side='left')
         ttk.Button(actions, text='导出全部 CSV / JSON', command=self.export).pack(side='right')
         footer = ttk.Frame(self, padding=20)
         footer.pack(side='bottom', fill='x', before=body)
@@ -201,6 +209,10 @@ class App(tk.Tk):
                     failed = sum(r.status == '失败' for r in self.results)
                     prefix = '已停止' if self.cancel.is_set() else '扫描完成'
                     self.status.set(f'{prefix} · 识别 {count} 个码 · 失败 {failed} 项 · 共 {len(self.results)} 条记录')
+                    if not self.cancel.is_set() and self.auto_open.get():
+                        first = next((r for r in self.results if r.status == '已识别' and web_url(r.text)), None)
+                        if first is not None:
+                            self.launch_url(web_url(first.text))
         except Empty:
             pass
         if changed:
@@ -209,6 +221,7 @@ class App(tk.Tk):
 
     def refresh(self):
         self.table.delete(*self.table.get_children())
+        self.details()
         query = self.query.get().casefold()
         for index, row in enumerate(self.results):
             if self.only_codes.get() and row.status != '已识别':
@@ -221,10 +234,36 @@ class App(tk.Tk):
         selected = self.table.selection()
         self.detail.configure(state='normal')
         self.detail.delete('1.0', 'end')
+        self.open_button.configure(state='disabled')
         if selected:
             row = self.results[int(selected[0])]
-            self.detail.insert('end', f'{row.source} · 第 {row.page} 页\n{row.text}\n位置：{row.position}')
+            url = web_url(row.text) if row.status == '已识别' else None
+            if url:
+                self.open_button.configure(state='normal')
+            hint = '网址二维码 · 点击「打开网页」或双击此行查看网页内容' if url else f'位置：{row.position}'
+            self.detail.insert('end', f'{row.source} · 第 {row.page} 页\n{row.text}\n{hint}')
         self.detail.configure(state='disabled')
+
+    def open_clicked_webpage(self, event):
+        item = self.table.identify_row(event.y)
+        if item:
+            self.table.selection_set(item)
+            self.open_webpage()
+
+    def open_webpage(self):
+        selected = self.table.selection()
+        if selected:
+            row = self.results[int(selected[0])]
+            url = web_url(row.text) if row.status == '已识别' else None
+            if url:
+                self.launch_url(url)
+
+    def launch_url(self, url):
+        try:
+            if not webbrowser.open(url, new=2):
+                raise OSError('系统未能启动默认浏览器，请复制网址手动打开。')
+        except Exception as exc:
+            messagebox.showerror('打开网页失败', str(exc))
 
     def copy(self):
         selected = self.table.selection()

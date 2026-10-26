@@ -74,7 +74,7 @@ class App(tk.Tk):
         if self.reference:
             self.reference_label.set(f'已记住 {len(self.reference)} 个实际台号')
         ttk.Label(left, textvariable=self.reference_label, wraplength=240).pack(anchor='w', pady=(0, 8))
-        ttk.Label(left, text='微信实读（试验）：\n先扫描文件，再在微信「+ → 写笔记」\n新建空白笔记，保持打开。\n点击「微信实读（试验）」。\n读取期间请勿操作微信或鼠标。\nF8 停止；窗口切换时中止本项。', wraplength=240, foreground='#315bdf').pack(anchor='w', pady=(0, 8))
+        ttk.Label(left, text='微信实读（试验）：\n先扫描文件，保持电脑版微信登录。\n点击「微信实读」，自动准备空白笔记。\n读取期间请勿操作微信或鼠标。\nF8 停止；窗口切换时中止本项。', wraplength=245, foreground='#315bdf').pack(anchor='w', pady=(0, 8))
         self.file_list = tk.Listbox(left, width=28, height=8, borderwidth=0, font=('Microsoft YaHei UI', 10), selectmode='extended')
         self.file_list.pack(fill='both', expand=True)
         self.file_list.bind('<Delete>', self.remove_files)
@@ -123,11 +123,12 @@ class App(tk.Tk):
         footer = ttk.Frame(self, padding=20)
         footer.pack(side='bottom', fill='x', before=body)
         self.status = tk.StringVar(value='就绪 · 添加文件、文件夹，或复制截图后点击「粘贴截图」')
-        ttk.Label(footer, textvariable=self.status).pack(anchor='w')
+        ttk.Label(footer, textvariable=self.status, wraplength=1200).pack(anchor='w')
         self.progress = ttk.Progressbar(footer, mode='determinate')
         self.progress.pack(fill='x', pady=(10, 0))
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.after(80, self.poll)
+        self.after_idle(lambda: body.sashpos(0, 280))
 
     def add(self, paths):
         known = {str(p).casefold() for p in self.files}
@@ -257,6 +258,8 @@ class App(tk.Tk):
                     count = sum(r.live_status == '已读取' for r in self.results)
                     self.status.set(f'微信读取结束 · 实际读取 {count} 条 · {value or "完成"}')
                     changed = True
+                    if value and not self.cancel.is_set():
+                        messagebox.showerror('微信读取未完成', str(value))
                 elif kind == 'done':
                     self.running = False
                     for button in self.mutable + [self.start_button]:
@@ -374,13 +377,14 @@ class App(tk.Tk):
         from datetime import datetime
         from uuid import uuid4
         reason = ''
-        active = []
+        active = next(iter(groups.values()), [])
         try:
             import uiautomation as auto
             from wechat_reader import WeChatReader
             evidence_dir = self.settings_path.parent / 'evidence' / (datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid4().hex[:8])
             with auto.UIAutomationInitializerInThread():
                 reader = WeChatReader(self.cancel, evidence_dir)
+                self.events.put(('status', '正在准备微信空白笔记，请勿操作微信和鼠标…'))
                 reader.prepare()
                 for sequence, (payload, indices) in enumerate(groups.items(), 1):
                     active = indices

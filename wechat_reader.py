@@ -78,6 +78,55 @@ def check_runtime():
     return {'ui_automation': True, 'qr': True, 'ocr_models': True}
 
 
+def find_new_note_button(image):
+    """Locate WeChat's observed circle-plus glyph, never a fixed screen point."""
+    import cv2
+    import numpy as np
+    gray = cv2.cvtColor(np.asarray(image.convert('RGB')), cv2.COLOR_RGB2GRAY)
+    # The plus button is beside the search field in the upper-left toolbar.
+    height = min(125, gray.shape[0])
+    width = min(gray.shape[1], max(480, int(gray.shape[1] * .65)))
+    roi = gray[:height, :width]
+    background = float(np.median(roi[28:min(80, height), 60:width]))
+    circles = cv2.HoughCircles(roi, cv2.HOUGH_GRADIENT, 1, 18,
+                               param1=70, param2=11, minRadius=6, maxRadius=15)
+    candidates = []
+    for cx, cy, radius in (circles[0] if circles is not None else []):
+        cx, cy, radius = round(float(cx)), round(float(cy)), round(float(radius))
+        if cx < 80 or cy < 28 or cy >= height - 8:
+            continue
+        best = -1
+        center = (cx, cy)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                x, y = cx + dx, cy + dy
+                d = max(2, radius // 3)
+                if x - d < 0 or x + d >= roi.shape[1] or y - d < 0 or y + d >= roi.shape[0]:
+                    continue
+                cross = np.concatenate((roi[y, x-d:x+d+1], roi[y-d:y+d+1, x]))
+                corners = np.array([roi[y-d, x-d], roi[y-d, x+d], roi[y+d, x-d], roi[y+d, x+d]], dtype=float)
+                if abs(float(corners.mean()) - background) > 35:
+                    continue  # Text glyphs in the chat title are not toolbar icons.
+                score = abs(float(corners.mean()) - float(cross.mean()))
+                if score > best:
+                    best, center = score, (x, y)
+        cx, cy = center
+        rim = []
+        for angle in np.linspace(0, 2 * np.pi, 32, endpoint=False):
+            samples = []
+            for r in (radius - 1.5, radius - 1, radius - .5, radius, radius + .5, radius + 1):
+                x, y = round(cx + r * np.cos(angle)), round(cy + r * np.sin(angle))
+                if 0 <= y < roi.shape[0] and 0 <= x < roi.shape[1]:
+                    samples.append(abs(background - float(roi[y, x])))
+            rim.append(max(samples, default=0))
+        if best > 45 and sum(v > 35 for v in rim) >= 28:
+            candidates.append((best, cx, cy))
+    candidates.sort(reverse=True)
+    if not candidates or (len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 8):
+        raise ReaderError('未能唯一识别微信搜索框旁的「+」按钮。请将已登录的微信主窗口恢复为普通聊天界面。')
+    return candidates[0][1:]
+
+
 class WeChatReader:
     def __init__(self, cancel, evidence_dir, timeout=25):
         import uiautomation as auto
@@ -224,21 +273,61 @@ class WeChatReader:
         return ImageGrab.grab(bbox=box, all_screens=True), box
 
     def prepare(self):
+        candidates = self.note_editors()
+        empty = [(h, editor) for h, editor in candidates if self.editor_empty(editor)]
+        if len(empty) != 1:
+            # Open a NEW note; never clear, reuse or overwrite a populated user note.
+            self.create_note()
+            def ready_note():
+                found = [(h, e) for h, e in self.note_editors() if self.editor_empty(e)]
+                focused = [(h, e) for h, e in found if self.focused(h)]
+                if len(focused) == 1:
+                    return focused[0]
+                return found[0] if len(found) == 1 else None
+            self.note, self.editor = self.wait_for(ready_note, '微信未打开可编辑的空白笔记。请确认未被登录或权限弹窗阻挡。')
+        else:
+            self.note, self.editor = empty[0]
+        self.activate(self.note)
+
+    def note_editors(self):
         candidates = []
         for handle, (_, process) in self.windows().items():
             if process != 'wechatappex.exe':
                 continue
-            editors = [n for n in self.nodes(handle) if n.AutomationId == 'xeditorInputId']
+            editors = []
+            for node in self.nodes(handle):
+                try:
+                    if node.AutomationId == 'xeditorInputId' and not node.IsOffscreen:
+                        editors.append(node)
+                except Exception:
+                    continue
             if len(editors) == 1:
                 candidates.append((handle, editors[0]))
-        if len(candidates) != 1:
-            raise ReaderError('请先在微信「+ → 写笔记」新建一个专用空白笔记，并保持打开；只能打开一个笔记窗口。')
-        self.note, self.editor = candidates[0]
-        self.activate(self.note)
-        # Do not replace or delete existing notes. A dedicated empty note is required.
-        text = self.editor.GetValuePattern().Value if self.editor.GetPattern(self.auto.PatternId.ValuePattern) else ''
-        if text.strip():
-            raise ReaderError('请使用新建的空白笔记，程序不会清空已有笔记。')
+        return candidates
+
+    def editor_empty(self, editor):
+        try:
+            value = editor.GetPattern(self.auto.PatternId.ValuePattern)
+            if value is None:
+                return False
+            return not editor.GetValuePattern().Value.strip()
+        except Exception:
+            return False
+
+    def create_note(self):
+        main = [h for h, (title, process) in self.windows().items()
+                if title == '微信' and process in ('weixin.exe', 'wechat.exe')]
+        if len(main) != 1:
+            raise ReaderError('未找到唯一的电脑版微信主窗口，请先打开并登录微信。')
+        handle = main[0]
+        self.activate(handle)
+        image, bounds = self.screenshot(handle)
+        x, y = find_new_note_button(image)
+        self.guard(handle)
+        self.auto.Click(bounds[0] + x, bounds[1] + y)
+        self.pause(.3)
+        self.click_text(handle, '写笔记')
+        self.pause(.7)
 
     def wait_for(self, finder, message):
         deadline = time.monotonic() + self.timeout
@@ -259,13 +348,16 @@ class WeChatReader:
         return box[0] + (p.top_left.x + p.bottom_right.x) // 2, box[1] + (p.top_left.y + p.bottom_right.y) // 2
 
     def recognize_menu(self, handle):
+        self.click_text(handle, '识别图中二维码')
+
+    def click_text(self, handle, label):
         import numpy as np
         from table_audit import ocr_engine
         image, box = self.screenshot(handle)
         found, _ = ocr_engine()(np.asarray(image))
-        matches = [b for b, text, score in found or [] if '识别图中二维码' in text.replace(' ', '') and score > .7]
+        matches = [b for b, text, score in found or [] if label in text.replace(' ', '') and score > .7]
         if len(matches) != 1:
-            raise ReaderError('未找到微信「识别图中二维码」菜单；请确认微信版本支持图片识码')
+            raise ReaderError(f'未找到唯一的微信「{label}」菜单；当前界面可能被遮挡或版本不兼容')
         b = matches[0]
         self.guard(handle)
         self.auto.Click(round(box[0] + sum(p[0] for p in b) / 4), round(box[1] + sum(p[1] for p in b) / 4))

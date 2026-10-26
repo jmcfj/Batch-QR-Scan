@@ -6,6 +6,49 @@ from wechat_reader import parse_table, qr_image, ReaderError, LiveResult
 from table_audit import apply_reference
 
 
+def test_circle_plus_located_without_fixed_click_coordinates():
+    from PIL import Image, ImageDraw
+    from wechat_reader import find_new_note_button
+    image = Image.new('RGB', (1150, 740), '#f5f5f5')
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((415, 47, 431, 63), outline='#555555', width=1)
+    draw.line((420, 55, 426, 55), fill='#555555', width=1)
+    draw.line((423, 52, 423, 58), fill='#555555', width=1)
+    draw.ellipse((77, 52, 83, 58), outline='#aaaaaa', width=1)
+    x, y = find_new_note_button(image)
+    assert abs(x - 423) < 3 and abs(y - 55) < 3
+    with pytest.raises(ReaderError):
+        find_new_note_button(Image.new('RGB', (1150, 740), 'white'))
+
+
+def test_prepare_automatically_creates_note_when_missing():
+    from wechat_reader import WeChatReader
+    reader = WeChatReader.__new__(WeChatReader)
+    state = {'created': False}
+    reader.note_editors = lambda: [(42, 'new-editor')] if state['created'] else []
+    reader.editor_empty = lambda _: True
+    reader.create_note = lambda: state.update(created=True)
+    reader.wait_for = lambda finder, _: finder()
+    reader.focused = lambda _: True
+    reader.activate = lambda _: None
+    reader.prepare()
+    assert state['created'] and reader.note == 42 and reader.editor == 'new-editor'
+
+
+def test_populated_note_is_preserved_when_creating_fresh_note():
+    from wechat_reader import WeChatReader
+    reader = WeChatReader.__new__(WeChatReader)
+    state = {'created': False}
+    reader.note_editors = lambda: [(42, 'old')] + ([(43, 'fresh')] if state['created'] else [])
+    reader.editor_empty = lambda editor: editor == 'fresh'
+    reader.create_note = lambda: state.update(created=True)
+    reader.wait_for = lambda finder, _: finder()
+    reader.focused = lambda h: h == 43
+    reader.activate = lambda _: None
+    reader.prepare()
+    assert reader.note == 43 and reader.editor == 'fresh'
+
+
 @pytest.mark.parametrize('texts,expected', [
     (['欢迎来到', 'metom（陈村店）', '桌号：C6', '1', '2', '开始点餐'], 'C6'),
     (['台号:', 'A01', '菜单'], 'A01'),
@@ -72,6 +115,7 @@ def test_live_batch_updates_only_matching_rows(monkeypatch, desktop_app):
 
 def test_live_failure_stops_queue_without_stale_table(monkeypatch, desktop_app):
     app = desktop_app
+    monkeypatch.setattr('app.messagebox.showerror', lambda *_: None)
     app.results = [Result('a.png', 1, '已识别', text='https://example.com/1', actual_table='old'),
                    Result('a.png', 1, '已识别', text='https://example.com/2', actual_table='old')]
     calls = []
@@ -92,4 +136,27 @@ def test_live_failure_stops_queue_without_stale_table(monkeypatch, desktop_app):
     assert not app.running and len(calls) == 1
     assert all(not r.actual_table for r in app.results)
     assert app.results[0].live_status.startswith('读取失败')
+    assert app.results[1].live_status.startswith('未执行')
+
+
+def test_preparation_error_is_shown_and_attached_to_first_row(monkeypatch, desktop_app):
+    app = desktop_app
+    errors = []
+    monkeypatch.setattr('app.messagebox.showerror', lambda title, text: errors.append((title, text)))
+    app.results = [Result('a.png', 1, '已识别', text='https://example.com/1'),
+                   Result('a.png', 1, '已识别', text='https://example.com/2')]
+    class UnavailableReader:
+        def __init__(self, *_):
+            pass
+        def prepare(self):
+            raise ReaderError('未找到已登录微信')
+    monkeypatch.setattr('wechat_reader.WeChatReader', UnavailableReader)
+    app.start_live()
+    deadline = time.monotonic() + 10
+    while app.running and time.monotonic() < deadline:
+        app.update()
+        time.sleep(.02)
+    assert not app.running
+    assert errors == [('微信读取未完成', '未找到已登录微信')]
+    assert app.results[0].live_status == '读取失败：未找到已登录微信'
     assert app.results[1].live_status.startswith('未执行')

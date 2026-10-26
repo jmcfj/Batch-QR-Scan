@@ -1,4 +1,5 @@
 from threading import Event
+from pathlib import Path
 import time
 import pytest
 from scanner import Result
@@ -160,3 +161,109 @@ def test_preparation_error_is_shown_and_attached_to_first_row(monkeypatch, deskt
     assert errors == [('微信读取未完成', '未找到已登录微信')]
     assert app.results[0].live_status == '读取失败：未找到已登录微信'
     assert app.results[1].live_status.startswith('未执行')
+
+
+def test_focus_loss_pauses_and_resumes_same_item_then_next(monkeypatch, desktop_app):
+    from wechat_reader import FocusLost
+    app = desktop_app
+    app.results = [Result('a.png', 1, '已识别', text='https://example.com/1'),
+                   Result('a.png', 1, '已识别', text='https://example.com/2')]
+    calls = []
+    class PausingReader:
+        def __init__(self, cancel, *_):
+            self.cancel = cancel
+        def prepare(self):
+            pass
+        def read(self, text, sequence):
+            calls.append(text)
+            if len(calls) == 1:
+                raise FocusLost(42)
+            return LiveResult('A' + str(sequence), '测试点餐')
+        def wait_until_return(self, handle, resume):
+            while not resume.wait(.01):
+                if self.cancel.is_set():
+                    raise InterruptedError('已停止')
+        def reset_pending_windows(self):
+            pass
+    monkeypatch.setattr('wechat_reader.WeChatReader', PausingReader)
+    app.start_live()
+    deadline = time.monotonic() + 5
+    while not app.results[0].live_status.startswith('暂停') and time.monotonic() < deadline:
+        app.update()
+        time.sleep(.02)
+    assert app.running and str(app.resume_button['state']) == 'normal'
+    assert app.results[1].live_status == '等待微信读取'
+    app.resume_button.invoke()
+    while app.running and time.monotonic() < deadline:
+        app.update()
+        time.sleep(.02)
+    assert not app.running
+    assert calls == ['https://example.com/1', 'https://example.com/1', 'https://example.com/2']
+    assert [r.actual_table for r in app.results] == ['A1', 'A2']
+    assert all(r.live_status == '已读取' for r in app.results)
+
+
+def test_background_page_read_does_not_activate_or_screenshot_other_app(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import json
+    import win32gui
+    import win32api
+    from wechat_reader import WeChatReader
+    payload = 'https://example.com/table?dId=123'
+    image = qr_image(payload)
+    reader = WeChatReader.__new__(WeChatReader)
+    reader.cancel = Event()
+    reader.evidence_dir = tmp_path
+    reader.note = 1
+    reader.editor = SimpleNamespace(SetFocus=lambda: None)
+    reader.timeout = 1
+    reader.owned_windows = set()
+    reader.started = False
+    reader.pending_payload = None
+    state = {'phase': 'note', 'visible': {1}}
+    activations, captures = [], []
+    def activate(handle):
+        activations.append(handle)
+    def click(*_, **__):
+        state['phase'] = 'viewer'
+        state['visible'].add(2)
+    def recognize(_):
+        state['phase'] = 'background-page'
+        state['visible'].add(3)
+    def screenshot(handle):
+        captures.append(handle)
+        assert handle in (1, 2)
+        return image, (0, 0, image.width, image.height)
+    reader.activate = activate
+    reader.screenshot = screenshot
+    reader.focused = lambda h: (state['phase'] == 'note' and h == 1) or (state['phase'] == 'viewer' and h == 2)
+    reader.windows = lambda: {h: {1: ('微信', 'wechatappex.exe'), 2: ('图片和视频', 'weixin.exe'), 3: ('测试点餐', 'wechatappex.exe')}[h] for h in state['visible']}
+    reader.guard = lambda _: None
+    reader.pause = lambda _: None
+    reader.recognize_menu = recognize
+    reader.page_texts = lambda _: ['欢迎来到', '测试餐厅', '桌号：a01']
+    reader.auto = SimpleNamespace(SendKeys=lambda *_, **__: None, Click=click, RightClick=lambda *_: None)
+    monkeypatch.setattr('wechat_reader.copy_qr', lambda _: None)
+    monkeypatch.setattr(win32gui, 'GetForegroundWindow', lambda: 999 if state['phase'] == 'background-page' else 2)
+    monkeypatch.setattr(win32gui, 'GetWindowText', lambda _: '测试点餐')
+    monkeypatch.setattr(win32gui, 'PostMessage', lambda h, *_: state['visible'].discard(h))
+    monkeypatch.setattr(win32gui, 'IsWindow', lambda h: h in state['visible'])
+    monkeypatch.setattr(win32gui, 'IsWindowVisible', lambda h: h in state['visible'])
+    monkeypatch.setattr(win32api, 'GetLastInputInfo', lambda: 0)
+    result = reader.read(payload, 1)
+    assert result.table == 'a01'
+    assert activations == [1, 2] and captures == [1, 2]
+    evidence = json.loads(Path(result.evidence).read_text(encoding='utf-8'))
+    assert evidence['payload'] == payload and evidence['page_screenshot'] == ''
+    assert '桌号：a01' in evidence['page_texts']
+
+
+def test_stop_wins_over_resume_while_paused():
+    from wechat_reader import WeChatReader
+    reader = WeChatReader.__new__(WeChatReader)
+    reader.cancel = Event()
+    reader.cancel.set()
+    resume = Event()
+    resume.set()
+    with pytest.raises(InterruptedError):
+        reader.wait_until_return(0, resume)

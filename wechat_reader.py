@@ -16,6 +16,12 @@ class ReaderError(RuntimeError):
     pass
 
 
+class FocusLost(ReaderError):
+    def __init__(self, handle, message='已暂停：正在使用其他窗口，返回微信后自动继续，或点击「继续读取」'):
+        super().__init__(message)
+        self.handle = handle
+
+
 @dataclass
 class LiveResult:
     table: str
@@ -26,19 +32,22 @@ class LiveResult:
 def parse_table(texts):
     """Only accept explicitly labelled table numbers, never other page numbers."""
     lines = [str(t).strip() for t in texts if str(t).strip()]
-    candidates = set()
+    from table_audit import comparison_key
+    candidates = {}
     prefix = r'(?:桌台编号|桌台号|餐桌号|桌号|台号)\s*[:：]'
     token = r'[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff _\-]{0,23}'
     for i, line in enumerate(lines):
         match = re.fullmatch(prefix + r'\s*(' + token + r')', line)
         if match:
-            candidates.add(match[1].strip())
+            value = match[1].strip()
+            candidates.setdefault(comparison_key(value), value)
         elif re.fullmatch(prefix + r'\s*', line) and i + 1 < len(lines):
             if re.fullmatch(token, lines[i + 1]):
-                candidates.add(lines[i + 1])
+                value = lines[i + 1]
+                candidates.setdefault(comparison_key(value), value)
     if len(candidates) != 1:
         raise ReaderError('页面未显示唯一明确的桌号，或含多个不同桌号')
-    return next(iter(candidates))
+    return next(iter(candidates.values()))
 
 
 def qr_image(payload):
@@ -136,6 +145,9 @@ class WeChatReader:
         self.timeout = timeout
         self.note = None
         self.owned_windows = set()
+        self.pending_payload = None
+        self.started = False
+        self.last_table_window = None
 
     def pause(self, seconds=.3):
         import win32api
@@ -262,8 +274,28 @@ class WeChatReader:
         if self.cancel.is_set():
             raise InterruptedError('已停止')
         if not self.focused(handle):
-            foreground = gui.GetForegroundWindow()
-            raise ReaderError(f'检测到窗口切换，已中止本项，避免误操作其他窗口（当前：{gui.GetWindowText(foreground)[:60]}）')
+            raise FocusLost(handle)
+
+    def wait_until_return(self, handle, resume):
+        """Wait read-only; never steal focus while the user works elsewhere."""
+        import win32gui as gui
+        while True:
+            if self.cancel.is_set():
+                raise InterruptedError('已停止微信读取')
+            if resume.is_set() or (gui.IsWindow(handle) and self.focused(handle)):
+                return
+            self.pause(.2)
+
+    def reset_pending_windows(self):
+        """Discard only task-owned previews/pages before retrying the same QR."""
+        import win32gui as gui
+        import win32con as con
+        for handle in tuple(self.owned_windows):
+            if gui.IsWindow(handle):
+                gui.PostMessage(handle, con.WM_CLOSE, 0, 0)
+                self.wait_for(lambda: not gui.IsWindow(handle) or not gui.IsWindowVisible(handle), '临时窗口未关闭，无法安全重试当前二维码')
+        self.owned_windows.clear()
+        self.started = False  # Resume is explicit / triggered by returning to WeChat.
 
     def screenshot(self, handle):
         import win32gui as gui
@@ -368,17 +400,24 @@ class WeChatReader:
         import zxingcpp
         if self.note is None:
             self.prepare()
+        if self.started and not self.focused(self.note):
+            raise FocusLost(self.note)
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         qr_path = self.evidence_dir / f'{sequence:04d}-qr.png'
         qr_image(payload).save(qr_path)
         before = set(self.windows())
         self.activate(self.note)
+        self.started = True
         self.editor.SetFocus()
         self.guard(self.note)
-        self.auto.SendKeys('{Ctrl}{End}{Enter}', waitTime=.1)
-        copy_qr(payload)
-        self.guard(self.note)
-        self.auto.SendKeys('{Ctrl}v', waitTime=.2)
+        if self.pending_payload != payload:
+            self.auto.SendKeys('{Ctrl}{End}{Enter}', waitTime=.1)
+            copy_qr(payload)
+            self.guard(self.note)
+            self.auto.SendKeys('{Ctrl}v', waitTime=.2)
+            self.pending_payload = payload
+        else:
+            self.auto.SendKeys('{Ctrl}{End}', waitTime=.1)
         self.pause(.6)
         image, bounds = self.screenshot(self.note)
         matches = [c for c in zxingcpp.read_barcodes(image) if c.text == payload]
@@ -396,12 +435,14 @@ class WeChatReader:
         elif any(t == '图片和视频' and self.focused(h) for h, (t, _) in self.windows().items()):
             pass
         else:
-            raise ReaderError('打开图片时窗口发生意外切换，已停止')
+            raise FocusLost(self.note)
         def new_viewer():
-            candidates = [h for h, (t, _) in self.windows().items() if t == '图片和视频' and self.focused(h)]
+            candidates = [h for h, (t, _) in self.windows().items() if t == '图片和视频']
             return candidates[0] if len(candidates) == 1 else None
         viewer = self.wait_for(new_viewer, '未打开新的微信图片预览；请关闭旧图片预览后重试')
         self.owned_windows.add(viewer)
+        if not self.focused(viewer) and not self.focused(self.note):
+            raise FocusLost(viewer)
         self.activate(viewer)
         x, y = self.viewer_code(viewer, payload)
         baseline = set(self.windows())
@@ -417,11 +458,12 @@ class WeChatReader:
             return candidates[0] if candidates else None
         page = self.wait_for(new_page, '没有打开新的点餐小程序；可能需要手机微信、登录或手动授权')
         self.owned_windows.add(page)
-        self.activate(page)
+        self.last_table_window = page
         last_table, stable = '', 0
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
-            self.guard(page)
+            # UI Automation reads this task's new page without global input or
+            # focus changes, so the user can work in another application here.
             texts = self.page_texts(page)
             try:
                 table = parse_table(texts)
@@ -431,19 +473,34 @@ class WeChatReader:
             last_table = table
             if table and stable >= 1:
                 self.evidence_dir.mkdir(parents=True, exist_ok=True)
-                evidence = self.evidence_dir / f'{sequence:04d}.png'
-                self.screenshot(page)[0].save(evidence)
+                evidence = self.evidence_dir / f'{sequence:04d}.json'
+                screenshot = self.evidence_dir / f'{sequence:04d}.png'
+                if self.focused(page):
+                    try:
+                        self.screenshot(page)[0].save(screenshot)
+                    except FocusLost:
+                        pass  # Text evidence remains valid if focus changes.
                 title = gui.GetWindowText(page)
-                (self.evidence_dir / f'{sequence:04d}.json').write_text(json.dumps({
+                evidence.write_text(json.dumps({
                     'payload': payload, 'table': table, 'app': title,
-                    'page_screenshot': str(evidence), 'single_qr': str(qr_path),
+                    'page_screenshot': str(screenshot) if screenshot.exists() else '', 'single_qr': str(qr_path),
+                    'page_texts': texts, 'read_mode': 'UIAutomation',
                     'read_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
                 }, ensure_ascii=False, indent=2), encoding='utf-8')
+                import win32api
+                task_was_focused = self.focused(page) or self.focused(viewer) or self.focused(self.note)
+                last_input = win32api.GetLastInputInfo()
                 gui.PostMessage(page, con.WM_CLOSE, 0, 0)
                 self.wait_for(lambda: not gui.IsWindow(page) or not gui.IsWindowVisible(page), '点餐窗口未关闭，已中止以防串台')
                 gui.PostMessage(viewer, con.WM_CLOSE, 0, 0)
                 self.wait_for(lambda: not gui.IsWindow(viewer) or not gui.IsWindowVisible(viewer), '图片预览未关闭，已中止以防串码')
                 self.owned_windows.clear()
-                return LiveResult(table, title, str(evidence))
+                self.pending_payload = None
+                if task_was_focused and win32api.GetLastInputInfo() == last_input:
+                    try:
+                        self.activate(self.note)
+                    except ReaderError:
+                        pass  # This result remains valid; the next item can pause.
+                return LiveResult(table, title, str(screenshot if screenshot.exists() else evidence))
             self.pause(.5)
         raise ReaderError('点餐页面未显示可读取的桌号，已保留页面；未选择人数或执行点餐')

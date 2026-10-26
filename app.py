@@ -23,6 +23,7 @@ class App(tk.Tk):
         self.files, self.results = [], []
         self.events = Queue()
         self.cancel = Event()
+        self.resume_event = Event()
         self.running = False
         self.settings_path = Path(settings_path) if settings_path else Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'BatchQRScan' / 'reference.json'
         self.reference, self.reference_evidence = read_reference_state(self.settings_path)
@@ -52,6 +53,8 @@ class App(tk.Tk):
         self.live_button = ttk.Button(toolbar, text='微信实读（试验）', command=self.start_live, style='Accent.TButton')
         self.live_button.pack(side='left', padx=8)
         self.mutable.append(self.live_button)
+        self.resume_button = ttk.Button(toolbar, text='继续读取', command=self.resume_event.set, state='disabled')
+        self.resume_button.pack(side='left')
         body = ttk.Panedwindow(self, orient='horizontal')
         body.pack(fill='both', expand=True, padx=20)
         left = ttk.Frame(body, padding=12)
@@ -74,7 +77,7 @@ class App(tk.Tk):
         if self.reference:
             self.reference_label.set(f'已记住 {len(self.reference)} 个实际台号')
         ttk.Label(left, textvariable=self.reference_label, wraplength=240).pack(anchor='w', pady=(0, 8))
-        ttk.Label(left, text='微信实读（试验）：\n先扫描文件，保持电脑版微信登录。\n点击「微信实读」，自动准备空白笔记。\n读取期间请勿操作微信或鼠标。\nF8 停止；窗口切换时中止本项。', wraplength=245, foreground='#315bdf').pack(anchor='w', pady=(0, 8))
+        ttk.Label(left, text='微信实读（试验）：\n点餐页文字可尝试后台读取。\n需要点击时仍需微信在前台。\n切换软件会暂停，保留队列；\n回到微信或点「继续读取」可恢复。\nF8 停止整批。', wraplength=245, foreground='#315bdf').pack(anchor='w', pady=(0, 8))
         self.file_list = tk.Listbox(left, width=28, height=8, borderwidth=0, font=('Microsoft YaHei UI', 10), selectmode='extended')
         self.file_list.pack(fill='both', expand=True)
         self.file_list.bind('<Delete>', self.remove_files)
@@ -214,6 +217,8 @@ class App(tk.Tk):
 
     def stop(self):
         self.cancel.set()
+        self.resume_event.set()
+        self.resume_button.configure(state='disabled')
         self.status.set('正在停止 · 等待当前页处理结束')
         self.stop_button.configure(state='disabled')
 
@@ -247,11 +252,28 @@ class App(tk.Tk):
                     for i in indices:
                         self.results[i].live_status = f'读取失败：{reason}'
                     changed = True
+                elif kind == 'live_cancelled':
+                    for i in value:
+                        self.results[i].live_status = '已停止'
+                    changed = True
+                elif kind == 'live_paused':
+                    indices, reason = value
+                    for i in indices:
+                        self.results[i].live_status = '暂停：等待返回微信'
+                    self.resume_button.configure(state='normal')
+                    self.status.set(str(reason))
+                    changed = True
+                elif kind == 'live_resumed':
+                    for i in value:
+                        self.results[i].live_status = '等待微信读取'
+                    self.resume_button.configure(state='disabled')
+                    changed = True
                 elif kind == 'live_done':
                     self.running = False
                     for button in self.mutable + [self.start_button]:
                         button.configure(state='normal')
                     self.stop_button.configure(state='disabled')
+                    self.resume_button.configure(state='disabled')
                     for row in self.results:
                         if row.live_status == '等待微信读取':
                             row.live_status = '未执行：已停止或前项失败'
@@ -359,6 +381,7 @@ class App(tk.Tk):
             messagebox.showinfo('微信读取台号', '请先添加排版图或 PDF，并扫描出包含网址的桌台码。')
             return
         self.cancel.clear()
+        self.resume_event.clear()
         self.running = True
         for button in self.mutable + [self.start_button]:
             button.configure(state='disabled')
@@ -380,20 +403,33 @@ class App(tk.Tk):
         active = next(iter(groups.values()), [])
         try:
             import uiautomation as auto
-            from wechat_reader import WeChatReader
+            from wechat_reader import WeChatReader, FocusLost
             evidence_dir = self.settings_path.parent / 'evidence' / (datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid4().hex[:8])
             with auto.UIAutomationInitializerInThread():
                 reader = WeChatReader(self.cancel, evidence_dir)
+                def resumable(operation):
+                    while True:
+                        try:
+                            return operation()
+                        except FocusLost as exc:
+                            self.resume_event.clear()
+                            self.events.put(('live_paused', (active, str(exc))))
+                            reader.wait_until_return(exc.handle, self.resume_event)
+                            reader.reset_pending_windows()
+                            self.events.put(('live_resumed', active))
                 self.events.put(('status', '正在准备微信空白笔记，请勿操作微信和鼠标…'))
-                reader.prepare()
+                resumable(reader.prepare)
                 for sequence, (payload, indices) in enumerate(groups.items(), 1):
                     active = indices
                     if self.cancel.is_set():
                         raise InterruptedError('已停止')
-                    self.events.put(('status', f'微信实读 {sequence}/{len(groups)} · 请勿操作微信或鼠标'))
-                    result = reader.read(payload, sequence)
+                    self.events.put(('status', f'微信实读 {sequence}/{len(groups)} · 切换窗口时会暂停，队列保留'))
+                    result = resumable(lambda: reader.read(payload, sequence))
                     self.events.put(('live_row', (indices, result)))
                     self.events.put(('progress', sequence))
+        except InterruptedError as exc:
+            reason = str(exc)
+            self.events.put(('live_cancelled', active))
         except Exception as exc:
             reason = str(exc)
             if active:

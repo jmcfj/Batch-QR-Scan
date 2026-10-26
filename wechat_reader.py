@@ -579,7 +579,7 @@ class WeChatReader:
                 evidence.write_text(json.dumps({
                     'payload': payload, 'table': table, 'app': title,
                     'page_screenshot': str(screenshot) if screenshot.exists() else '', 'single_qr': str(qr_path),
-                    'page_texts': texts, 'read_mode': 'UIAutomation',
+                    'page_texts': texts, 'read_mode': 'user-region UIA/OCR' if profile_record else 'UIAutomation',
                     'reading_region': profile_record.rect if profile_record else None,
                     'system_profile': profile_record.key if profile_record else '',
                     'read_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),

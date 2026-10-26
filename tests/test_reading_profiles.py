@@ -26,6 +26,8 @@ def test_label_or_plain_value_and_ambiguity():
     with pytest.raises(RegionReadError):
         interpret_texts(['￥28.00'])
     with pytest.raises(RegionReadError):
+        interpret_texts(['桌号：', 'A', '1'])
+    with pytest.raises(RegionReadError):
         validate_rect((0, 0, 1, 1))
 
 
@@ -88,3 +90,15 @@ def test_new_system_asks_once_and_then_reuses(monkeypatch, tmp_path):
     assert reader.guided_table(1, 'https://b.example/1', 5)[0] == 'A1'
     assert reader.guided_table(1, 'https://b.example/2', 5)[0] == 'A1'
     assert len(calls) == 1
+
+
+def test_ocr_fallback_reads_only_the_user_selected_image_area():
+    from PIL import ImageDraw, ImageFont
+    from reading_profiles import read_ocr
+    image = Image.new('RGB', (400, 600), 'white')
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=28)
+    draw.text((15, 240), 'B99', fill='black', font=font)
+    draw.text((265, 240), 'A01', fill='black', font=font)
+    value, _, _ = read_ocr(image, (.6, .35, .95, .5))
+    assert value == 'A01'

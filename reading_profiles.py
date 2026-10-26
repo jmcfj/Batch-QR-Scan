@@ -93,6 +93,8 @@ def interpret_texts(texts):
         return next(iter(labelled.values())), anchors[0]
     if len(labelled) > 1 or len(plain) != 1:
         raise RegionReadError('选区内没有唯一台号，请缩小到台号及标签，避开人数、价格等数字')
+    if any(re.fullmatch(r'[A-Za-z]+', t) for t in lines) and value_kind(next(iter(plain.values()))) == 'number':
+        raise RegionReadError('台号文字被拆分，需通过选区图片读取完整台号')
     return next(iter(plain.values())), anchors[0] if anchors else ''
 
 
@@ -114,7 +116,7 @@ def read_ocr(image, rect):
 def verify_value(profile, value, anchor):
     if profile.anchor and anchor != profile.anchor:
         raise RegionReadError('台号标签与已保存模板不一致，未采用该结果')
-    if not profile.anchor and value_kind(value) != profile.kind:
+    if value_kind(value) != profile.kind:
         raise RegionReadError('台号格式与已保存模板不一致，未采用该结果')
     return value
 

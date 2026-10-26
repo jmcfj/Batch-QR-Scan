@@ -350,10 +350,10 @@ class App(tk.Tk):
             return
         groups = {}
         for i, row in enumerate(self.results):
-            if row.status == '已识别' and row.text:
+            if row.status == '已识别' and web_url(row.text):
                 groups.setdefault(row.text, []).append(i)
         if not groups:
-            messagebox.showinfo('微信读取台号', '请先添加排版图或 PDF 并扫描出二维码。')
+            messagebox.showinfo('微信读取台号', '请先添加排版图或 PDF，并扫描出包含网址的桌台码。')
             return
         self.cancel.clear()
         self.running = True
@@ -449,4 +449,16 @@ class App(tk.Tk):
 
 
 if __name__ == '__main__':
+    import sys
+    if len(sys.argv) == 3 and sys.argv[1] == '--check-runtime':
+        import json
+        from wechat_reader import check_runtime
+        try:
+            result = check_runtime()
+            code = 0
+        except Exception as exc:
+            result = {'error': str(exc)}
+            code = 1
+        Path(sys.argv[2]).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+        sys.exit(code)
     App().mainloop()

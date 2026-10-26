@@ -66,6 +66,18 @@ def copy_qr(payload):
         cb.CloseClipboard()
 
 
+def check_runtime():
+    """Read-only packaging check: no window activation or input."""
+    import uiautomation as auto
+    import win32gui
+    from table_audit import ocr_engine
+    root = auto.GetRootControl()
+    _ = root.Name  # Exercises the generated UIAutomation COM bindings.
+    qr_image('batch-qr-runtime-check')
+    ocr_engine()
+    return {'ui_automation': True, 'qr': True, 'ocr_models': True}
+
+
 class WeChatReader:
     def __init__(self, cancel, evidence_dir, timeout=25):
         import uiautomation as auto

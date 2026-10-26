@@ -86,7 +86,7 @@ class App(tk.Tk):
         ttk.Button(actions, text='复制选中内容', command=self.copy).pack(side='left')
         ttk.Button(actions, text='导出全部 CSV / JSON', command=self.export).pack(side='right')
         footer = ttk.Frame(self, padding=20)
-        footer.pack(fill='x')
+        footer.pack(side='bottom', fill='x', before=body)
         self.status = tk.StringVar(value='就绪 · 添加文件、文件夹，或复制截图后点击「粘贴截图」')
         ttk.Label(footer, textvariable=self.status).pack(anchor='w')
         self.progress = ttk.Progressbar(footer, mode='determinate')

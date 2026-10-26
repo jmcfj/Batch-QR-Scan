@@ -2,12 +2,22 @@
 import csv
 import re
 import unicodedata
+import json
+from pathlib import Path
 from functools import lru_cache
 from urllib.parse import urlsplit, parse_qs
 
 
 def normalize_label(value):
     return unicodedata.normalize('NFKC', value).strip().upper()
+
+
+def heading_label(text):
+    value = normalize_label(text)
+    if any(word in value for word in ('密码', '账号', '帐号', 'WIFI', 'WIF1', 'W1FI', 'W1F1')):
+        return ''
+    match = re.match(r'^([A-Z]{1,4}\s*\d{1,4})(?!\d)', value)
+    return re.sub(r'\s+', '', match[1]) if match else ''
 
 
 @lru_cache(maxsize=1)
@@ -24,14 +34,14 @@ def printed_labels(image):
     labels = []
     for box, text, score in found or []:
         # Restrict automatic label detection; never interpret the Wi-Fi password.
-        match = re.match(r'^([A-Za-z]{1,4}\s*\d{1,4})(?!\d)', normalize_label(text))
-        if not match or score < .85:
+        label = heading_label(text)
+        if not label or score < .85:
             continue
         labels.append((min(p[0] for p in box) / factor,
                        min(p[1] for p in box) / factor,
                        max(p[0] for p in box) / factor,
                        max(p[1] for p in box) / factor,
-                       re.sub(r'\s+', '', match[1])))
+                       label))
     return labels
 
 
@@ -60,10 +70,10 @@ def url_table_info(text):
     return internal_id, next(iter(names)) if len(names) == 1 else ''
 
 
-def apply_reference(row, reference):
+def apply_reference(row, reference, evidence='独立对照清单'):
     row.table_id, param_name = url_table_info(row.text)
     row.actual_table = reference.get(row.text.strip(), '') or param_name
-    row.table_evidence = '独立对照清单' if row.text.strip() in reference else ('链接台号参数' if param_name else '')
+    row.table_evidence = evidence if row.text.strip() in reference else ('链接台号参数' if param_name else '')
     if row.status != '已识别':
         row.table_check = '无法核对'
     elif not row.actual_table:
@@ -92,3 +102,52 @@ def load_reference(path):
     if not reference:
         raise ValueError('对照清单为空')
     return reference
+
+
+def load_reference_folder(folder):
+    """Backend export: one barcode per file, authoritative table name in filename.
+
+    Exact payload matching keeps merchant identity and every URL parameter intact.
+    Reject the whole import on unreadable/ambiguous/conflicting entries.
+    """
+    from scanner import SUPPORTED, scan_file
+    root = Path(folder)
+    if not root.is_dir():
+        raise ValueError('原始码文件夹不存在')
+    reference = {}
+    for path in sorted(root.rglob('*')):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED:
+            continue
+        rows = [r for page in scan_file(path) for r in page]
+        if len(rows) != 1 or rows[0].status != '已识别':
+            raise ValueError(f'{path.name}：每个后台原码文件必须只包含一个可识别的码，请排除排版图或损坏文件。')
+        text, name = rows[0].text.strip(), path.stem.strip()
+        if not text or not name:
+            raise ValueError(f'{path.name}：缺少内容或台号文件名')
+        if text in reference and normalize_label(reference[text]) != normalize_label(name):
+            raise ValueError(f'原码冲突：同一个码同时命名为 {reference[text]} 和 {name}，请先核实后台原始文件。')
+        reference[text] = name
+    if not reference:
+        raise ValueError('文件夹中没有可识别的后台原码图片或 PDF')
+    return reference
+
+
+def save_reference_state(path, reference, evidence):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps({'reference': reference, 'evidence': evidence}, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(path)
+
+
+def read_reference_state(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        reference, evidence = data['reference'], data['evidence']
+        if not isinstance(reference, dict) or not isinstance(evidence, str):
+            raise ValueError('Invalid reference data')
+        if not all(isinstance(k, str) and isinstance(v, str) and k and v for k, v in reference.items()):
+            raise ValueError('Invalid table names')
+        return reference, evidence
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}, '独立对照清单'

@@ -3,8 +3,8 @@ from app import App
 
 
 @pytest.fixture(scope='session')
-def desktop():
-    app = App()
+def desktop(tmp_path_factory):
+    app = App(settings_path=tmp_path_factory.mktemp('settings') / 'reference.json')
     app.withdraw()
     yield app
     app.destroy()
@@ -18,4 +18,5 @@ def desktop_app(desktop):
     desktop.auto_open.set(True)
     desktop.audit_mode.set(False)
     desktop.reference = {}
+    desktop.reference_evidence = '独立对照清单'
     yield desktop

@@ -3,6 +3,13 @@ from scanner import Result
 from table_audit import label_for, apply_reference, load_reference
 
 
+def test_wifi_text_not_mistaken_for_orphan_table():
+    from table_audit import heading_label
+    assert heading_label('A01扫码点餐') == 'A01'
+    assert heading_label('WIF1密码:mt123456') == ''
+    assert heading_label('W1F1 密码:mt123456') == ''
+
+
 def test_match_geometry_and_ambiguity():
     labels = [(50, 35, 140, 55, 'A01'), (195, 35, 285, 55, 'A02')]
     assert label_for((61, 64, 133, 136), labels) == 'A01'
@@ -69,3 +76,54 @@ def test_label_without_code_is_not_silently_ignored(monkeypatch):
     rows = decode(Image.new('RGB', (200, 200), 'white'), 'blank.png', 1, audit=True)
     assert len(rows) == 1
     assert rows[0].printed_table == 'A01' and rows[0].status == '未发现码'
+
+
+def test_backend_originals_resolve_actual_tables_and_conflicts(tmp_path):
+    from test_scanner import barcode
+    from table_audit import load_reference_folder
+    first = 'https://example.com/qrcode/shop?dId=123456'
+    second = 'https://example.com/qrcode/shop?dId=999999'
+    barcode(first).save(tmp_path / 'A01.png')
+    barcode(second).save(tmp_path / 'A02.png')
+    (tmp_path / 'design.cdr').write_bytes(b'ignored')
+    reference = load_reference_folder(tmp_path)
+    assert reference == {first: 'A01', second: 'A02'}
+    row = Result('sheet.png', 1, '已识别', text=second, printed_table='A01')
+    apply_reference(row, reference, '后台原始码文件名')
+    assert row.actual_table == 'A02' and row.table_check == '不一致'
+    assert row.table_evidence == '后台原始码文件名'
+    barcode(first).save(tmp_path / 'C01.png')
+    with pytest.raises(ValueError, match='原码冲突'):
+        load_reference_folder(tmp_path)
+
+
+def test_bad_backend_original_not_accepted(tmp_path):
+    from PIL import Image
+    from table_audit import load_reference_folder
+    Image.new('RGB', (150, 150), 'white').save(tmp_path / 'A01.png')
+    with pytest.raises(ValueError, match='可识别'):
+        load_reference_folder(tmp_path)
+
+
+def test_reference_remembered_without_user_data_in_repo(tmp_path):
+    from table_audit import save_reference_state, read_reference_state
+    path = tmp_path / 'settings' / 'reference.json'
+    reference = {'https://example.com/?dId=123': 'A01'}
+    save_reference_state(path, reference, '后台原始码文件名：原码')
+    assert read_reference_state(path) == (reference, '后台原始码文件名：原码')
+    path.write_text('corrupt', encoding='utf-8')
+    assert read_reference_state(path)[0] == {}
+
+
+def test_import_original_folder_updates_existing_results(monkeypatch, tmp_path, desktop_app):
+    from test_scanner import barcode
+    from table_audit import read_reference_state
+    app = desktop_app
+    url = 'https://example.com/shop?dId=12345'
+    barcode(url).save(tmp_path / 'A08.png')
+    app.results = [Result('sheet.png', 1, '已识别', text=url, printed_table='A09')]
+    monkeypatch.setattr('app.filedialog.askdirectory', lambda **_: str(tmp_path))
+    app.import_original_folder()
+    assert app.results[0].actual_table == 'A08'
+    assert app.results[0].table_check == '不一致'
+    assert read_reference_state(app.settings_path)[0] == {url: 'A08'}

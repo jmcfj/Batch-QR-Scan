@@ -4,16 +4,17 @@ from queue import Queue, Empty
 from threading import Thread, Event
 import webbrowser
 import csv
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from scanner import SUPPORTED, scan_file, export_results
 from links import web_url
-from table_audit import apply_reference, load_reference
+from table_audit import apply_reference, load_reference, load_reference_folder, read_reference_state, save_reference_state
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, settings_path=None):
         super().__init__()
         self.title('Batch QR Scan · 批量扫码')
         self.geometry('1320x850')
@@ -23,7 +24,8 @@ class App(tk.Tk):
         self.events = Queue()
         self.cancel = Event()
         self.running = False
-        self.reference = {}
+        self.settings_path = Path(settings_path) if settings_path else Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'BatchQRScan' / 'reference.json'
+        self.reference, self.reference_evidence = read_reference_state(self.settings_path)
         self.audit_enabled = True
         style = ttk.Style(self)
         style.theme_use('clam')
@@ -59,10 +61,15 @@ class App(tk.Tk):
         self.audit_toggle = ttk.Checkbutton(left, text='识别码上方的印刷台号', variable=self.audit_mode)
         self.audit_toggle.pack(anchor='w', pady=(0, 8))
         self.mutable.append(self.audit_toggle)
+        original_button = ttk.Button(left, text='导入后台原始码文件夹', command=self.import_original_folder, style='Accent.TButton')
+        original_button.pack(fill='x', pady=(0, 8))
+        self.mutable.append(original_button)
         reference_button = ttk.Button(left, text='导入实际台号对照 CSV', command=self.import_reference)
         reference_button.pack(fill='x', pady=(0, 8))
         self.mutable.append(reference_button)
         self.reference_label = tk.StringVar(value='未导入对照 · 实际台号待核实')
+        if self.reference:
+            self.reference_label.set(f'已记住 {len(self.reference)} 个实际台号')
         ttk.Label(left, textvariable=self.reference_label, wraplength=240).pack(anchor='w', pady=(0, 8))
         self.file_list = tk.Listbox(left, width=28, height=8, borderwidth=0, font=('Microsoft YaHei UI', 10), selectmode='extended')
         self.file_list.pack(fill='both', expand=True)
@@ -211,9 +218,9 @@ class App(tk.Tk):
             for _ in range(200):
                 kind, value = self.events.get_nowait()
                 if kind == 'rows':
-                    if self.audit_enabled:
+                    if self.audit_enabled or self.reference:
                         for row in value:
-                            apply_reference(row, self.reference)
+                            apply_reference(row, self.reference, self.reference_evidence)
                     self.results.extend(value)
                     changed = True
                 elif kind == 'status':
@@ -306,12 +313,32 @@ class App(tk.Tk):
         except (OSError, ValueError, csv.Error) as exc:
             messagebox.showerror('导入失败', str(exc))
             return
+        self.set_reference(reference, f'独立 CSV 清单：{Path(path).name}')
+
+    def set_reference(self, reference, evidence):
         self.reference = reference
-        self.reference_label.set(f'已载入 {len(reference)} 条独立对照')
+        self.reference_evidence = evidence
+        self.reference_label.set(f'已载入 {len(reference)} 个实际台号\n{evidence}')
         for row in self.results:
-            apply_reference(row, self.reference)
+            apply_reference(row, self.reference, self.reference_evidence)
         self.refresh()
         self.status.set('已按独立清单重新核对，未覆盖的二维码保持待核实')
+        try:
+            save_reference_state(self.settings_path, reference, evidence)
+        except OSError as exc:
+            messagebox.showwarning('对照已载入，但无法记住设置', str(exc))
+
+    def import_original_folder(self):
+        folder = filedialog.askdirectory(title='选择后台导出的原始码文件夹（文件名即台号，例如 A01.jpg）')
+        if not folder:
+            return
+        try:
+            reference = load_reference_folder(folder)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror('后台原始码导入失败', str(exc))
+            return
+        self.set_reference(reference, f'后台原始码文件名：{Path(folder).name}')
+        self.status.set(f'已导入并记住 {len(reference)} 个后台台号，可以添加排版图开始核对')
 
     def export(self):
         if not self.results:

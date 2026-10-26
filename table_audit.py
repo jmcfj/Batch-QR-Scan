@@ -71,9 +71,19 @@ def url_table_info(text):
 
 
 def apply_reference(row, reference, evidence='独立对照清单'):
+    if row.live_status:
+        if row.live_status != '已读取':
+            row.actual_table = ''
+            row.table_evidence = ''
+        compare_table(row)
+        return
     row.table_id, param_name = url_table_info(row.text)
     row.actual_table = reference.get(row.text.strip(), '') or param_name
     row.table_evidence = evidence if row.text.strip() in reference else ('链接台号参数' if param_name else '')
+    compare_table(row)
+
+
+def compare_table(row):
     if row.status != '已识别':
         row.table_check = '无法核对'
     elif not row.actual_table:

@@ -25,6 +25,8 @@ class Result:
     table_id: str = ''
     table_check: str = ''
     table_evidence: str = ''
+    live_status: str = ''
+    live_evidence: str = ''
 
 
 def decode(image, source, page, audit=False):

@@ -10,7 +10,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from scanner import SUPPORTED, scan_file, export_results
 from links import web_url
-from table_audit import apply_reference, load_reference, load_reference_folder, read_reference_state, save_reference_state
+from table_audit import apply_reference, compare_table, load_reference, load_reference_folder, read_reference_state, save_reference_state
 
 
 class App(tk.Tk):
@@ -49,6 +49,9 @@ class App(tk.Tk):
         self.start_button.pack(side='right')
         self.stop_button = ttk.Button(toolbar, text='停止', command=self.stop, state='disabled')
         self.stop_button.pack(side='right', padx=8)
+        self.live_button = ttk.Button(toolbar, text='微信实读（试验）', command=self.start_live, style='Accent.TButton')
+        self.live_button.pack(side='left', padx=8)
+        self.mutable.append(self.live_button)
         body = ttk.Panedwindow(self, orient='horizontal')
         body.pack(fill='both', expand=True, padx=20)
         left = ttk.Frame(body, padding=12)
@@ -71,6 +74,7 @@ class App(tk.Tk):
         if self.reference:
             self.reference_label.set(f'已记住 {len(self.reference)} 个实际台号')
         ttk.Label(left, textvariable=self.reference_label, wraplength=240).pack(anchor='w', pady=(0, 8))
+        ttk.Label(left, text='微信实读（试验）：\n先扫描文件，再在微信「+ → 写笔记」\n新建空白笔记，保持打开。\n点击「微信实读（试验）」。\n读取期间请勿操作微信或鼠标。\nF8 停止；窗口切换时中止本项。', wraplength=240, foreground='#315bdf').pack(anchor='w', pady=(0, 8))
         self.file_list = tk.Listbox(left, width=28, height=8, borderwidth=0, font=('Microsoft YaHei UI', 10), selectmode='extended')
         self.file_list.pack(fill='both', expand=True)
         self.file_list.bind('<Delete>', self.remove_files)
@@ -86,9 +90,9 @@ class App(tk.Tk):
         self.query.trace_add('write', lambda *_: self.refresh())
         table = ttk.Frame(right)
         table.pack(fill='both', expand=True)
-        cols = ('source', 'page', 'printed_table', 'actual_table', 'table_check', 'text', 'table_id', 'status', 'format')
+        cols = ('source', 'page', 'printed_table', 'actual_table', 'table_check', 'live_status', 'text', 'table_id', 'status', 'format')
         self.table = ttk.Treeview(table, columns=cols, height=8, show='headings', selectmode='extended')
-        for key, label, width in zip(cols, ['来源文件', '页码', '印刷台号', '实际台号', '核对结果', '二维码原文', '内部桌台 ID', '扫码状态', '码类型'], [120, 50, 90, 90, 175, 240, 210, 90, 100]):
+        for key, label, width in zip(cols, ['来源文件', '页码', '印刷台号', '实际台号', '核对结果', '微信读取状态', '二维码原文', '内部桌台 ID', '扫码状态', '码类型'], [120, 50, 90, 90, 175, 185, 240, 210, 90, 100]):
             self.table.heading(key, text=label)
             self.table.column(key, width=width, minwidth=50, stretch=key in ('source', 'text'))
         sy = ttk.Scrollbar(table, orient='vertical', command=self.table.yview)
@@ -227,6 +231,32 @@ class App(tk.Tk):
                     self.status.set(value)
                 elif kind == 'progress':
                     self.progress['value'] = value
+                elif kind == 'live_row':
+                    indices, result = value
+                    for i in indices:
+                        row = self.results[i]
+                        row.actual_table = result.table
+                        row.table_evidence = f'微信实际页面：{result.app}'
+                        row.live_evidence = result.evidence
+                        row.live_status = '已读取'
+                        compare_table(row)
+                    changed = True
+                elif kind == 'live_fail':
+                    indices, reason = value
+                    for i in indices:
+                        self.results[i].live_status = f'读取失败：{reason}'
+                    changed = True
+                elif kind == 'live_done':
+                    self.running = False
+                    for button in self.mutable + [self.start_button]:
+                        button.configure(state='normal')
+                    self.stop_button.configure(state='disabled')
+                    for row in self.results:
+                        if row.live_status == '等待微信读取':
+                            row.live_status = '未执行：已停止或前项失败'
+                    count = sum(r.live_status == '已读取' for r in self.results)
+                    self.status.set(f'微信读取结束 · 实际读取 {count} 条 · {value or "完成"}')
+                    changed = True
                 elif kind == 'done':
                     self.running = False
                     for button in self.mutable + [self.start_button]:
@@ -261,7 +291,7 @@ class App(tk.Tk):
             if query and query not in f'{row.source} {row.text} {row.format} {row.status} {row.printed_table} {row.actual_table} {row.table_id} {row.table_check}'.casefold():
                 continue
             tag = 'match' if row.table_check == '一致' else ('mismatch' if row.table_check == '不一致' else 'pending')
-            self.table.insert('', 'end', iid=str(index), values=(Path(row.source).name, row.page, row.printed_table or '未读到', row.actual_table or '未取得', row.table_check, row.text, row.table_id, row.status, row.format), tags=(tag,))
+            self.table.insert('', 'end', iid=str(index), values=(Path(row.source).name, row.page, row.printed_table or '未读到', row.actual_table or '未取得', row.table_check, row.live_status, row.text, row.table_id, row.status, row.format), tags=(tag,))
 
     def details(self, _=None):
         selected = self.table.selection()
@@ -274,7 +304,7 @@ class App(tk.Tk):
             if url:
                 self.open_button.configure(state='normal')
             hint = '网址二维码 · 点击「打开网页」或双击此行查看网页内容' if url else f'位置：{row.position}'
-            self.detail.insert('end', f'{row.source} · 第 {row.page} 页\n印刷：{row.printed_table or "未读到"} / 实际：{row.actual_table or "未取得"} / {row.table_check}\n依据：{row.table_evidence or "没有独立台号依据，内部 ID 不代表实际台号"}\n{row.text}\n{hint}')
+            self.detail.insert('end', f'{row.source} · 第 {row.page} 页\n印刷：{row.printed_table or "未读到"} / 实际：{row.actual_table or "未取得"} / {row.table_check}\n依据：{row.table_evidence or "没有独立台号依据，内部 ID 不代表实际台号"}\n微信：{row.live_status}  截图：{row.live_evidence}\n{row.text}\n{hint}')
         self.detail.configure(state='disabled')
 
     def open_clicked_webpage(self, event):
@@ -314,6 +344,58 @@ class App(tk.Tk):
             messagebox.showerror('导入失败', str(exc))
             return
         self.set_reference(reference, f'独立 CSV 清单：{Path(path).name}')
+
+    def start_live(self):
+        if self.running:
+            return
+        groups = {}
+        for i, row in enumerate(self.results):
+            if row.status == '已识别' and row.text:
+                groups.setdefault(row.text, []).append(i)
+        if not groups:
+            messagebox.showinfo('微信读取台号', '请先添加排版图或 PDF 并扫描出二维码。')
+            return
+        self.cancel.clear()
+        self.running = True
+        for button in self.mutable + [self.start_button]:
+            button.configure(state='disabled')
+        self.stop_button.configure(state='normal')
+        for indices in groups.values():
+            for i in indices:
+                row = self.results[i]
+                row.live_status = '等待微信读取'
+                row.actual_table = row.table_evidence = row.live_evidence = ''
+                compare_table(row)
+        self.refresh()
+        self.progress.configure(maximum=len(groups), value=0)
+        Thread(target=self.live_worker, args=(groups,), daemon=True).start()
+
+    def live_worker(self, groups):
+        from datetime import datetime
+        from uuid import uuid4
+        reason = ''
+        active = []
+        try:
+            import uiautomation as auto
+            from wechat_reader import WeChatReader
+            evidence_dir = self.settings_path.parent / 'evidence' / (datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid4().hex[:8])
+            with auto.UIAutomationInitializerInThread():
+                reader = WeChatReader(self.cancel, evidence_dir)
+                reader.prepare()
+                for sequence, (payload, indices) in enumerate(groups.items(), 1):
+                    active = indices
+                    if self.cancel.is_set():
+                        raise InterruptedError('已停止')
+                    self.events.put(('status', f'微信实读 {sequence}/{len(groups)} · 请勿操作微信或鼠标'))
+                    result = reader.read(payload, sequence)
+                    self.events.put(('live_row', (indices, result)))
+                    self.events.put(('progress', sequence))
+        except Exception as exc:
+            reason = str(exc)
+            if active:
+                self.events.put(('live_fail', (active, reason)))
+        finally:
+            self.events.put(('live_done', reason))
 
     def set_reference(self, reference, evidence):
         self.reference = reference

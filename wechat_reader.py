@@ -148,6 +148,10 @@ class WeChatReader:
         self.pending_payload = None
         self.started = False
         self.last_table_window = None
+        self.manual_note = False
+        self.selector = None
+        self.profile_store = None
+        self.calibration_wait = 0
 
     def pause(self, seconds=.3):
         import win32api
@@ -212,6 +216,79 @@ class WeChatReader:
         except Exception:
             pass
         return texts
+
+    def page_layout(self, handle):
+        import win32gui as gui
+        from reading_profiles import TextRegion
+        left, top, right, bottom = gui.GetWindowRect(handle)
+        width, height = max(1, right - left), max(1, bottom - top)
+        regions, documents, texts = [], [], []
+        for node in self.nodes(handle):
+            try:
+                if node.ControlTypeName == 'DocumentControl':
+                    value = node.GetPattern(self.auto.PatternId.ValuePattern)
+                    if value and value.Value:
+                        documents.append(value.Value)
+                if node.ControlTypeName != 'TextControl' or not node.Name:
+                    continue
+                text = node.Name
+                texts.append(text)
+                box = node.BoundingRectangle
+                if box.width() > 0 and box.height() > 0:
+                    regions.append(TextRegion(text, ((box.left - left) / width, (box.top - top) / height,
+                                                       (box.right - left) / width, (box.bottom - top) / height)))
+            except Exception:
+                continue
+        return regions, documents, (width, height), texts
+
+    def guided_table(self, page, payload, elapsed):
+        import win32gui as gui
+        from reading_profiles import (system_identity, read_regions, read_ocr,
+                                      verify_value, verify_geometry, RegionReadError)
+        regions, documents, size, texts = self.page_layout(page)
+        key, label = system_identity(gui.GetWindowText(page), payload, documents)
+        profile = self.profile_store.get(key)
+        calibrated = False
+        if profile is None:
+            try:
+                parse_table(texts)
+                ready = True
+            except ReaderError:
+                ready = elapsed >= 3 and not any('加载中' in t for t in texts)
+            if not ready:
+                raise RegionReadError('点餐页面尚未加载完成')
+            if not self.focused(page):
+                raise FocusLost(page, '首次需要指定台号位置，请返回本次点餐页或点击「继续读取」')
+            while True:
+                image, _ = self.screenshot(page)
+                began = time.monotonic()
+                selected = self.selector({'key': key, 'label': label, 'image': image, 'regions': regions})
+                self.calibration_wait = getattr(self, 'calibration_wait', 0) + time.monotonic() - began
+                if selected is None:
+                    raise InterruptedError('已取消台号位置引导')
+                if selected == 'refresh':
+                    self.activate(page)
+                    self.pause(1)
+                    regions, documents, size, texts = self.page_layout(page)
+                    key, label = system_identity(gui.GetWindowText(page), payload, documents)
+                    continue
+                if selected.key != key:
+                    raise ReaderError('台号模板与当前餐厅系统不匹配')
+                self.profile_store.save(selected)
+                profile = selected
+                calibrated = True
+                self.activate(page)
+                break
+        try:
+            table = read_regions(profile, regions, size)
+        except RegionReadError:
+            verify_geometry(profile, size)
+            if not self.focused(page):
+                raise FocusLost(page, '此系统需要读取框选区域图片，请返回点餐页或点击「继续读取」')
+            image, _ = self.screenshot(page)
+            value, anchor, _ = read_ocr(image, profile.rect)
+            table = verify_value(profile, value, anchor)
+        return table, texts, profile, calibrated
 
     def activate(self, handle):
         import win32gui as gui
@@ -308,6 +385,8 @@ class WeChatReader:
         candidates = self.note_editors()
         empty = [(h, editor) for h, editor in candidates if self.editor_empty(editor)]
         if len(empty) != 1:
+            if getattr(self, 'manual_note', False):
+                raise ReaderError('未找到已准备的唯一空白笔记。请手动在微信「+ → 写笔记」新建空白笔记并保持打开，再重试。')
             # Open a NEW note; never clear, reuse or overwrite a populated user note.
             self.create_note()
             def ready_note():
@@ -461,14 +540,30 @@ class WeChatReader:
         self.last_table_window = page
         last_table, stable = '', 0
         deadline = time.monotonic() + self.timeout
+        opened_at = time.monotonic()
+        profile_record = None
+        region_error = ''
         while time.monotonic() < deadline:
             # UI Automation reads this task's new page without global input or
             # focus changes, so the user can work in another application here.
-            texts = self.page_texts(page)
-            try:
-                table = parse_table(texts)
-            except ReaderError:
-                table = ''
+            if getattr(self, 'selector', None) and getattr(self, 'profile_store', None):
+                from reading_profiles import RegionReadError
+                prior_wait = getattr(self, 'calibration_wait', 0)
+                try:
+                    table, texts, profile_record, calibrated = self.guided_table(page, payload, time.monotonic() - opened_at)
+                    if calibrated:
+                        deadline = time.monotonic() + self.timeout
+                except RegionReadError as exc:
+                    region_error, table = str(exc), ''
+                    texts = []
+                finally:
+                    deadline += getattr(self, 'calibration_wait', 0) - prior_wait
+            else:
+                texts = self.page_texts(page)
+                try:
+                    table = parse_table(texts)
+                except ReaderError:
+                    table = ''
             stable = stable + 1 if table and table == last_table else 0
             last_table = table
             if table and stable >= 1:
@@ -485,6 +580,8 @@ class WeChatReader:
                     'payload': payload, 'table': table, 'app': title,
                     'page_screenshot': str(screenshot) if screenshot.exists() else '', 'single_qr': str(qr_path),
                     'page_texts': texts, 'read_mode': 'UIAutomation',
+                    'reading_region': profile_record.rect if profile_record else None,
+                    'system_profile': profile_record.key if profile_record else '',
                     'read_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
                 }, ensure_ascii=False, indent=2), encoding='utf-8')
                 import win32api
@@ -503,4 +600,4 @@ class WeChatReader:
                         pass  # This result remains valid; the next item can pause.
                 return LiveResult(table, title, str(screenshot if screenshot.exists() else evidence))
             self.pause(.5)
-        raise ReaderError('点餐页面未显示可读取的桌号，已保留页面；未选择人数或执行点餐')
+        raise ReaderError(f'已保存的台号区域未能读到有效值：{region_error}。请在「台号位置模板」中重设后重试。' if region_error else '点餐页面未显示可读取的桌号，已保留页面；未选择人数或执行点餐')

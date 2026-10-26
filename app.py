@@ -25,8 +25,12 @@ class App(tk.Tk):
         self.cancel = Event()
         self.resume_event = Event()
         self.running = False
+        self.pipeline_active = False
+        self.pending_region = None
         self.settings_path = Path(settings_path) if settings_path else Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'BatchQRScan' / 'reference.json'
         self.reference, self.reference_evidence = read_reference_state(self.settings_path)
+        from reading_profiles import ProfileStore
+        self.profile_store = ProfileStore(self.settings_path.parent / 'reading-profiles.json')
         self.audit_enabled = True
         style = ttk.Style(self)
         style.theme_use('clam')
@@ -39,6 +43,8 @@ class App(tk.Tk):
         header.pack(fill='x')
         tk.Label(header, text='▦  Batch QR Scan', font=('Microsoft YaHei UI', 24, 'bold'), fg='white', bg='#16233d').pack(anchor='w')
         tk.Label(header, text='餐厅桌台码核对 · 逐个对应印刷台号、二维码及实际台号', fg='#becbe5', bg='#16233d', font=('Microsoft YaHei UI', 11)).pack(anchor='w', pady=(6, 0))
+        self.workflow_status = tk.StringVar(value='添加文件并预览 → 开始扫描 → 准备微信 / 指定台号位置 → 自动读取整批')
+        tk.Label(header, textvariable=self.workflow_status, fg='#a9c3ff', bg='#16233d').pack(anchor='w', pady=(8, 0))
         toolbar = ttk.Frame(self, padding=(20, 16))
         toolbar.pack(fill='x')
         self.mutable = []
@@ -46,13 +52,10 @@ class App(tk.Tk):
             button = ttk.Button(toolbar, text=label, command=command)
             button.pack(side='left', padx=(0, 8))
             self.mutable.append(button)
-        self.start_button = ttk.Button(toolbar, text='开始扫描', command=self.start, style='Accent.TButton')
+        self.start_button = ttk.Button(toolbar, text='开始扫描', command=self.start_pipeline, style='Accent.TButton')
         self.start_button.pack(side='right')
         self.stop_button = ttk.Button(toolbar, text='停止', command=self.stop, state='disabled')
         self.stop_button.pack(side='right', padx=8)
-        self.live_button = ttk.Button(toolbar, text='微信实读（试验）', command=self.start_live, style='Accent.TButton')
-        self.live_button.pack(side='left', padx=8)
-        self.mutable.append(self.live_button)
         self.resume_button = ttk.Button(toolbar, text='继续读取', command=self.resume_event.set, state='disabled')
         self.resume_button.pack(side='left')
         body = ttk.Panedwindow(self, orient='horizontal')
@@ -61,11 +64,11 @@ class App(tk.Tk):
         right = ttk.Frame(body, padding=12)
         body.add(left, weight=1)
         body.add(right, weight=4)
-        self.file_count = tk.StringVar(value='待扫描文件 · 0')
+        self.file_count = tk.StringVar(value='已添加文件 · 0')
         ttk.Label(left, textvariable=self.file_count, font=('Microsoft YaHei UI', 12, 'bold')).pack(anchor='w', pady=(0, 10))
         files_frame = ttk.Frame(left)
         files_frame.pack(fill='both', expand=True, pady=(0, 8))
-        self.file_list = tk.Listbox(files_frame, width=30, height=8, borderwidth=0, font=('Microsoft YaHei UI', 10), selectmode='extended', exportselection=False)
+        self.file_list = tk.Listbox(files_frame, width=30, height=6, borderwidth=0, font=('Microsoft YaHei UI', 10), selectmode='extended', exportselection=False)
         file_scroll = ttk.Scrollbar(files_frame, command=self.file_list.yview)
         self.file_list.configure(yscrollcommand=file_scroll.set)
         self.file_list.pack(side='left', fill='both', expand=True)
@@ -78,18 +81,32 @@ class App(tk.Tk):
         self.audit_toggle = ttk.Checkbutton(left, text='识别码上方的印刷台号', variable=self.audit_mode)
         self.audit_toggle.pack(anchor='w', pady=(0, 8))
         self.mutable.append(self.audit_toggle)
-        original_button = ttk.Button(left, text='导入后台原始码文件夹', command=self.import_original_folder, style='Accent.TButton')
+        advanced = ttk.Frame(left)
+        def toggle_advanced():
+            if advanced.winfo_manager():
+                advanced.pack_forget()
+                advanced_toggle.configure(text='展开后台原码 / CSV 对照设置')
+            else:
+                advanced.pack(fill='x', after=advanced_toggle)
+                advanced_toggle.configure(text='收起后台原码 / CSV 对照设置')
+        advanced_toggle = ttk.Button(left, text='展开后台原码 / CSV 对照设置', command=toggle_advanced)
+        advanced_toggle.pack(fill='x', pady=(0, 8))
+        self.mutable.append(advanced_toggle)
+        original_button = ttk.Button(advanced, text='导入后台原始码文件夹', command=self.import_original_folder, style='Accent.TButton')
         original_button.pack(fill='x', pady=(0, 8))
         self.mutable.append(original_button)
-        reference_button = ttk.Button(left, text='导入实际台号对照 CSV', command=self.import_reference)
+        reference_button = ttk.Button(advanced, text='导入实际台号对照 CSV', command=self.import_reference)
         reference_button.pack(fill='x', pady=(0, 8))
         self.mutable.append(reference_button)
         self.reference_label = tk.StringVar(value='未导入对照 · 实际台号待核实')
         if self.reference:
             self.reference_label.set(f'已记住 {len(self.reference)} 个实际台号')
         ttk.Label(left, textvariable=self.reference_label, wraplength=240).pack(anchor='w', pady=(0, 8))
-        ttk.Label(left, text='微信实读（试验）：\n点餐页文字可尝试后台读取。\n需要点击时仍需微信在前台。\n切换软件会暂停，保留队列；\n回到微信或点「继续读取」可恢复。\nF8 停止整批。', wraplength=245, foreground='#315bdf').pack(anchor='w', pady=(0, 8))
-        ttk.Label(left, text='选中文件按 Delete 移除\n文件夹将递归导入；支持多页 TIFF', foreground='#667085').pack(anchor='w', pady=10)
+        ttk.Label(left, text='一键扫描并实读：\n先本地识码，再提醒你手动准备笔记。\n首次遇到新系统，框选一次台号位置；\n确认后自动继续，请勿切换窗口。\nF8 停止；切走后可点「继续读取」。', wraplength=245, foreground='#315bdf').pack(anchor='w', pady=(0, 8))
+        self.profile_count = tk.StringVar(value=f'台号位置模板（{len(self.profile_store.profiles)}）')
+        profile_button = ttk.Button(left, textvariable=self.profile_count, command=self.manage_profiles)
+        profile_button.pack(fill='x', pady=(0, 8))
+        self.mutable.append(profile_button)
         self.content_tabs = ttk.Notebook(right)
         self.content_tabs.pack(fill='both', expand=True)
         self.preview_tab = ttk.Frame(self.content_tabs, padding=10)
@@ -112,7 +129,8 @@ class App(tk.Tk):
         self.only_codes = tk.BooleanVar()
         ttk.Checkbutton(filters, text='仅已识别', variable=self.only_codes, command=self.refresh).pack(side='right', padx=12)
         self.query.trace_add('write', lambda *_: self.refresh())
-        table = ttk.Frame(self.results_tab)
+        table = ttk.Frame(self.results_tab, width=760, height=260)
+        table.grid_propagate(False)
         table.pack(fill='both', expand=True)
         cols = ('source', 'page', 'printed_table', 'actual_table', 'table_check', 'live_status', 'text', 'table_id', 'status', 'format')
         self.table = ttk.Treeview(table, columns=cols, height=8, show='headings', selectmode='extended')
@@ -142,7 +160,6 @@ class App(tk.Tk):
         self.open_button = ttk.Button(actions, text='打开网页', command=self.open_webpage, state='disabled')
         self.open_button.pack(side='left', padx=8)
         self.auto_open = tk.BooleanVar(value=False)
-        ttk.Checkbutton(actions, text='扫描后打开首个网页', variable=self.auto_open).pack(side='left')
         ttk.Button(actions, text='导出全部 CSV / JSON', command=self.export).pack(side='right')
         footer = ttk.Frame(self, padding=20)
         footer.pack(side='bottom', fill='x', before=body)
@@ -152,7 +169,12 @@ class App(tk.Tk):
         self.progress.pack(fill='x', pady=(10, 0))
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.after(80, self.poll)
-        self.after_idle(lambda: body.sashpos(0, 280))
+        self.initial_sash_set = False
+        def set_initial_sash(event):
+            if not self.initial_sash_set and event.width > 500:
+                self.initial_sash_set = True
+                self.after_idle(lambda: body.sashpos(0, 300))
+        body.bind('<Configure>', set_initial_sash)
 
     def add(self, paths):
         known = {str(p).casefold() for p in self.files}
@@ -164,7 +186,7 @@ class App(tk.Tk):
                 known.add(str(path).casefold())
                 self.file_list.insert('end', path.name)
                 added += 1
-        self.file_count.set(f'待扫描文件 · {len(self.files)}')
+        self.file_count.set(f'已添加文件 · {len(self.files)}')
         if self.files:
             self.file_list.selection_clear(0, 'end')
             self.file_list.selection_set(len(self.files) - 1)
@@ -238,16 +260,17 @@ class App(tk.Tk):
         for i in reversed(self.file_list.curselection()):
             del self.files[i]
             self.file_list.delete(i)
-        self.file_count.set(f'待扫描文件 · {len(self.files)}')
+        self.file_count.set(f'已添加文件 · {len(self.files)}')
         if self.files:
             self.file_list.selection_set(0)
         self.show_file_preview()
 
     def clear(self):
+        self.pipeline_active = False
         self.files.clear()
         self.results.clear()
         self.file_list.delete(0, 'end')
-        self.file_count.set('待扫描文件 · 0')
+        self.file_count.set('已添加文件 · 0')
         self.show_file_preview()
         self.refresh()
         self.progress['value'] = 0
@@ -267,6 +290,26 @@ class App(tk.Tk):
         self.stop_button.configure(state='normal')
         self.progress.configure(maximum=len(self.files), value=0)
         Thread(target=self.worker, args=(tuple(self.files),), daemon=True).start()
+
+    def start_pipeline(self):
+        if self.running:
+            return
+        if not self.files:
+            messagebox.showinfo('开始扫描', '请先添加图片或 PDF，左侧文件列表和右侧预览会确认添加结果。')
+            return
+        self.pipeline_active = True
+        self.workflow_status.set('第 1 阶段：正在识别文件中的二维码和印刷台号')
+        self.start()
+
+    def show_preparation(self, count):
+        from workflow_ui import PreparationDialog
+        self.workflow_status.set('第 2 阶段：请手动准备微信空白笔记，此时可以切换窗口')
+        def ready():
+            self.workflow_status.set('开始自动读取：请勿切换窗口；首次位置引导弹出时请框出台号')
+            self.start_live()
+        def cancel():
+            self.workflow_status.set('已保留本地扫码结果，尚未开始微信读取')
+        return PreparationDialog(self, count, ready, cancel)
 
     def worker(self, files):
         try:
@@ -289,6 +332,10 @@ class App(tk.Tk):
 
     def poll(self):
         changed = False
+        if self.running and self.pending_region:
+            import win32api
+            if win32api.GetAsyncKeyState(0x77) & 0x8000:
+                self.stop()
         try:
             for _ in range(200):
                 kind, value = self.events.get_nowait()
@@ -328,11 +375,31 @@ class App(tk.Tk):
                     self.resume_button.configure(state='normal')
                     self.status.set(str(reason))
                     changed = True
+                    self.workflow_status.set('队列已暂停：返回微信或点击「继续读取」，已完成的结果保留')
                 elif kind == 'live_resumed':
                     for i in value:
                         self.results[i].live_status = '等待微信读取'
                     self.resume_button.configure(state='disabled')
                     changed = True
+                    self.workflow_status.set('自动读取已恢复：请勿切换窗口，等待整批完成')
+                elif kind == 'region_request':
+                    from workflow_ui import RegionPicker
+                    ticket = value
+                    self.pending_region = ticket
+                    self.workflow_status.set('首次引导：请在截图中框出台号位置，确认后会自动继续整批')
+                    def complete(result, ticket=ticket):
+                        ticket['result'] = result
+                        if result is None:
+                            self.stop()
+                        elif result != 'refresh':
+                            self.workflow_status.set('台号位置已确认，自动继续读取整批；请勿切换窗口')
+                        ticket['event'].set()
+                    ticket['dialog'] = RegionPicker(self, ticket, complete)
+                elif kind == 'cancel_region':
+                    dialog = value.get('dialog')
+                    if dialog is not None and dialog.winfo_exists():
+                        dialog.destroy()
+                    self.pending_region = None
                 elif kind == 'live_done':
                     self.running = False
                     for button in self.mutable + [self.start_button]:
@@ -344,10 +411,14 @@ class App(tk.Tk):
                             row.live_status = '未执行：已停止或前项失败'
                     count = sum(r.live_status == '已读取' for r in self.results)
                     self.status.set(f'微信读取结束 · 实际读取 {count} 条 · {value or "完成"}')
+                    self.workflow_status.set(f'本批结束 · 成功读取 {count} 条 · 可在结果表中核对或导出')
+                    self.profile_count.set(f'台号位置模板（{len(self.profile_store.profiles)}）')
                     changed = True
                     if value and not self.cancel.is_set():
                         messagebox.showerror('微信读取未完成', str(value))
                 elif kind == 'done':
+                    continue_pipeline = self.pipeline_active and not self.cancel.is_set()
+                    self.pipeline_active = False
                     self.running = False
                     for button in self.mutable + [self.start_button]:
                         button.configure(state='normal')
@@ -361,7 +432,13 @@ class App(tk.Tk):
                         mismatches = sum(r.table_check == '不一致' for r in self.results)
                         pending = count - matches - mismatches
                         self.status.set(f'{prefix} · {count} 个码 · 一致 {matches} · 不一致 {mismatches} · 待核实 {pending} · 失败 {failed}')
-                    if not self.cancel.is_set() and self.auto_open.get():
+                    if continue_pipeline:
+                        url_count = len({r.text for r in self.results if r.status == '已识别' and web_url(r.text)})
+                        if url_count:
+                            self.show_preparation(url_count)
+                        else:
+                            self.workflow_status.set('本地扫描完成：未发现可供微信读取的网址桌台码')
+                    if not continue_pipeline and not self.cancel.is_set() and self.auto_open.get():
                         first = next((r for r in self.results if r.status == '已识别' and web_url(r.text)), None)
                         if first is not None:
                             self.launch_url(web_url(first.text))
@@ -472,6 +549,9 @@ class App(tk.Tk):
             evidence_dir = self.settings_path.parent / 'evidence' / (datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid4().hex[:8])
             with auto.UIAutomationInitializerInThread():
                 reader = WeChatReader(self.cancel, evidence_dir)
+                reader.manual_note = True
+                reader.selector = self.request_reading_region
+                reader.profile_store = self.profile_store
                 def resumable(operation):
                     while True:
                         try:
@@ -482,7 +562,7 @@ class App(tk.Tk):
                             reader.wait_until_return(exc.handle, self.resume_event)
                             reader.reset_pending_windows()
                             self.events.put(('live_resumed', active))
-                self.events.put(('status', '正在准备微信空白笔记，请勿操作微信和鼠标…'))
+                self.events.put(('status', '正在连接已手动准备的微信笔记，请勿切换窗口…'))
                 resumable(reader.prepare)
                 for sequence, (payload, indices) in enumerate(groups.items(), 1):
                     active = indices
@@ -501,6 +581,44 @@ class App(tk.Tk):
                 self.events.put(('live_fail', (active, reason)))
         finally:
             self.events.put(('live_done', reason))
+
+    def request_reading_region(self, request):
+        ticket = dict(request, event=Event(), result=None)
+        self.events.put(('region_request', ticket))
+        while not ticket['event'].wait(.1):
+            if self.cancel.is_set():
+                self.events.put(('cancel_region', ticket))
+                raise InterruptedError('已停止台号位置引导')
+        self.pending_region = None
+        if self.cancel.is_set():
+            raise InterruptedError('已取消台号位置引导')
+        return ticket['result']
+
+    def manage_profiles(self):
+        dialog = tk.Toplevel(self)
+        dialog.title('已记住的台号位置')
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text='同一餐厅系统后续会复用已确认的位置。界面变化时可选择下次重新引导。').pack(anchor='w', pady=(0, 10))
+        listing = ttk.Treeview(frame, columns=('label', 'anchor'), show='headings', height=7)
+        listing.heading('label', text='餐厅系统')
+        listing.heading('anchor', text='台号标签')
+        listing.column('label', width=420)
+        listing.column('anchor', width=100)
+        listing.pack(fill='both', expand=True)
+        for key, profile in self.profile_store.profiles.items():
+            listing.insert('', 'end', iid=key, values=(profile.label, profile.anchor or '只读取框选值'))
+        def forget():
+            for key in listing.selection():
+                try:
+                    self.profile_store.forget(key)
+                except OSError as exc:
+                    messagebox.showerror('无法更新模板', str(exc))
+                    return
+                listing.delete(key)
+            self.profile_count.set(f'台号位置模板（{len(self.profile_store.profiles)}）')
+        ttk.Button(frame, text='选中系统下次重新引导', command=forget).pack(anchor='e', pady=(10, 0))
 
     def set_reference(self, reference, evidence):
         self.reference = reference

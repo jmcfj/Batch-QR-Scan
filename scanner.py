@@ -20,16 +20,45 @@ class Result:
     format: str = ''
     text: str = ''
     position: str = ''
+    printed_table: str = ''
+    actual_table: str = ''
+    table_id: str = ''
+    table_check: str = ''
+    table_evidence: str = ''
 
 
-def decode(image, source, page):
+def decode(image, source, page, audit=False):
     rgb = ImageOps.exif_transpose(image).convert('RGB')
     codes = zxingcpp.read_barcodes(rgb, try_rotate=True, try_downscale=True, try_invert=True)
-    return [Result(str(source), page, '已识别', str(c.format), c.text, str(c.position))
-            for c in codes] or [Result(str(source), page, '未发现码')]
+    rows = []
+    labels = []
+    ocr_error = ''
+    if audit:
+        from table_audit import printed_labels
+        try:
+            labels = printed_labels(rgb)
+        except Exception as exc:
+            ocr_error = f'印刷台号识别失败：{exc}'
+    for code in codes:
+        row = Result(str(source), page, '已识别', str(code.format), code.text, str(code.position))
+        if audit:
+            from table_audit import label_for, apply_reference
+            corners = [code.position.top_left, code.position.top_right, code.position.bottom_right, code.position.bottom_left]
+            bounds = (min(p.x for p in corners), min(p.y for p in corners), max(p.x for p in corners), max(p.y for p in corners))
+            row.printed_table = label_for(bounds, labels)
+            apply_reference(row, {})
+            if ocr_error:
+                row.table_check = ocr_error
+        rows.append(row)
+    if audit:
+        paired = {r.printed_table for r in rows if r.printed_table}
+        for label in labels:
+            if label[4] not in paired:
+                rows.append(Result(str(source), page, '未发现码', printed_table=label[4], table_check='无法核对：未发现对应码'))
+    return rows or [Result(str(source), page, '未发现码')]
 
 
-def scan_file(path, cancel=None, scale=3):
+def scan_file(path, cancel=None, scale=3, audit=False):
     """Yield page results; isolate bad files without interrupting a batch."""
     cancel = cancel or Event()
     path = Path(path)
@@ -48,7 +77,7 @@ def scan_file(path, cancel=None, scale=3):
                         bitmap = page.render(scale=factor)
                         try:
                             with bitmap.to_pil() as image:
-                                yield decode(image, path, page_num)
+                                yield decode(image, path, page_num, audit)
                         finally:
                             bitmap.close()
                     finally:
@@ -58,7 +87,7 @@ def scan_file(path, cancel=None, scale=3):
                 for page_num, frame in enumerate(ImageSequence.Iterator(image), 1):
                     if cancel.is_set():
                         return
-                    yield decode(frame, path, page_num)
+                    yield decode(frame, path, page_num, audit)
     except Exception as exc:
         yield [Result(str(path), page_num, '失败', text=str(exc))]
 

@@ -16,4 +16,6 @@ def desktop_app(desktop):
     desktop.query.set('')
     desktop.only_codes.set(False)
     desktop.auto_open.set(True)
+    desktop.audit_mode.set(False)
+    desktop.reference = {}
     yield desktop

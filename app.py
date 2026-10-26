@@ -3,24 +3,28 @@ from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread, Event
 import webbrowser
+import csv
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from scanner import SUPPORTED, scan_file, export_results
 from links import web_url
+from table_audit import apply_reference, load_reference
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Batch QR Scan · 批量扫码')
-        self.geometry('1180x760')
-        self.minsize(900, 600)
+        self.geometry('1320x850')
+        self.minsize(1000, 680)
         self.configure(bg='#f3f5f9')
         self.files, self.results = [], []
         self.events = Queue()
         self.cancel = Event()
         self.running = False
+        self.reference = {}
+        self.audit_enabled = True
         style = ttk.Style(self)
         style.theme_use('clam')
         style.configure('.', font=('Microsoft YaHei UI', 10))
@@ -31,7 +35,7 @@ class App(tk.Tk):
         header = tk.Frame(self, bg='#16233d', padx=26, pady=20)
         header.pack(fill='x')
         tk.Label(header, text='▦  Batch QR Scan', font=('Microsoft YaHei UI', 24, 'bold'), fg='white', bg='#16233d').pack(anchor='w')
-        tk.Label(header, text='批量识别图片与 PDF 中的二维码 / 条形码 · 本地处理', fg='#becbe5', bg='#16233d', font=('Microsoft YaHei UI', 11)).pack(anchor='w', pady=(6, 0))
+        tk.Label(header, text='餐厅桌台码核对 · 逐个对应印刷台号、二维码及实际台号', fg='#becbe5', bg='#16233d', font=('Microsoft YaHei UI', 11)).pack(anchor='w', pady=(6, 0))
         toolbar = ttk.Frame(self, padding=(20, 16))
         toolbar.pack(fill='x')
         self.mutable = []
@@ -51,6 +55,15 @@ class App(tk.Tk):
         body.add(right, weight=4)
         self.file_count = tk.StringVar(value='待扫描文件 · 0')
         ttk.Label(left, textvariable=self.file_count, font=('Microsoft YaHei UI', 12, 'bold')).pack(anchor='w', pady=(0, 10))
+        self.audit_mode = tk.BooleanVar(value=True)
+        self.audit_toggle = ttk.Checkbutton(left, text='识别码上方的印刷台号', variable=self.audit_mode)
+        self.audit_toggle.pack(anchor='w', pady=(0, 8))
+        self.mutable.append(self.audit_toggle)
+        reference_button = ttk.Button(left, text='导入实际台号对照 CSV', command=self.import_reference)
+        reference_button.pack(fill='x', pady=(0, 8))
+        self.mutable.append(reference_button)
+        self.reference_label = tk.StringVar(value='未导入对照 · 实际台号待核实')
+        ttk.Label(left, textvariable=self.reference_label, wraplength=240).pack(anchor='w', pady=(0, 8))
         self.file_list = tk.Listbox(left, width=28, height=8, borderwidth=0, font=('Microsoft YaHei UI', 10), selectmode='extended')
         self.file_list.pack(fill='both', expand=True)
         self.file_list.bind('<Delete>', self.remove_files)
@@ -66,9 +79,9 @@ class App(tk.Tk):
         self.query.trace_add('write', lambda *_: self.refresh())
         table = ttk.Frame(right)
         table.pack(fill='both', expand=True)
-        cols = ('source', 'page', 'status', 'format', 'text')
+        cols = ('source', 'page', 'printed_table', 'actual_table', 'table_check', 'text', 'table_id', 'status', 'format')
         self.table = ttk.Treeview(table, columns=cols, height=8, show='headings', selectmode='extended')
-        for key, label, width in zip(cols, ['来源文件', '页码', '状态', '码类型', '识别内容'], [170, 55, 85, 100, 320]):
+        for key, label, width in zip(cols, ['来源文件', '页码', '印刷台号', '实际台号', '核对结果', '二维码原文', '内部桌台 ID', '扫码状态', '码类型'], [120, 50, 90, 90, 175, 240, 210, 90, 100]):
             self.table.heading(key, text=label)
             self.table.column(key, width=width, minwidth=50, stretch=key in ('source', 'text'))
         sy = ttk.Scrollbar(table, orient='vertical', command=self.table.yview)
@@ -83,6 +96,9 @@ class App(tk.Tk):
         self.table.bind('<Control-c>', lambda _: self.copy())
         self.table.bind('<Double-1>', self.open_clicked_webpage)
         self.table.bind('<Return>', lambda _: self.open_webpage())
+        self.table.tag_configure('mismatch', background='#ffe4e4', foreground='#9b1c1c')
+        self.table.tag_configure('pending', background='#fff5d6')
+        self.table.tag_configure('match', background='#e5f6eb')
         self.detail = tk.Text(right, height=4, wrap='word', font=('Microsoft YaHei UI', 10), relief='flat', state='disabled')
         self.detail.pack(fill='x', pady=(10, 0))
         actions = ttk.Frame(right)
@@ -90,7 +106,7 @@ class App(tk.Tk):
         ttk.Button(actions, text='复制选中内容', command=self.copy).pack(side='left')
         self.open_button = ttk.Button(actions, text='打开网页', command=self.open_webpage, state='disabled')
         self.open_button.pack(side='left', padx=8)
-        self.auto_open = tk.BooleanVar(value=True)
+        self.auto_open = tk.BooleanVar(value=False)
         ttk.Checkbutton(actions, text='扫描后打开首个网页', variable=self.auto_open).pack(side='left')
         ttk.Button(actions, text='导出全部 CSV / JSON', command=self.export).pack(side='right')
         footer = ttk.Frame(self, padding=20)
@@ -162,6 +178,7 @@ class App(tk.Tk):
         if self.running or not self.files:
             return
         self.running = True
+        self.audit_enabled = self.audit_mode.get()
         self.cancel.clear()
         self.results.clear()
         self.refresh()
@@ -177,7 +194,7 @@ class App(tk.Tk):
                 if self.cancel.is_set():
                     break
                 self.events.put(('status', f'扫描中 · {index + 1}/{len(files)} · {path.name}'))
-                for rows in scan_file(path, self.cancel):
+                for rows in scan_file(path, self.cancel, audit=self.audit_enabled):
                     self.events.put(('rows', rows))
                 self.events.put(('progress', index + 1))
         finally:
@@ -194,6 +211,9 @@ class App(tk.Tk):
             for _ in range(200):
                 kind, value = self.events.get_nowait()
                 if kind == 'rows':
+                    if self.audit_enabled:
+                        for row in value:
+                            apply_reference(row, self.reference)
                     self.results.extend(value)
                     changed = True
                 elif kind == 'status':
@@ -209,6 +229,11 @@ class App(tk.Tk):
                     failed = sum(r.status == '失败' for r in self.results)
                     prefix = '已停止' if self.cancel.is_set() else '扫描完成'
                     self.status.set(f'{prefix} · 识别 {count} 个码 · 失败 {failed} 项 · 共 {len(self.results)} 条记录')
+                    if self.audit_enabled:
+                        matches = sum(r.table_check == '一致' for r in self.results)
+                        mismatches = sum(r.table_check == '不一致' for r in self.results)
+                        pending = count - matches - mismatches
+                        self.status.set(f'{prefix} · {count} 个码 · 一致 {matches} · 不一致 {mismatches} · 待核实 {pending} · 失败 {failed}')
                     if not self.cancel.is_set() and self.auto_open.get():
                         first = next((r for r in self.results if r.status == '已识别' and web_url(r.text)), None)
                         if first is not None:
@@ -226,9 +251,10 @@ class App(tk.Tk):
         for index, row in enumerate(self.results):
             if self.only_codes.get() and row.status != '已识别':
                 continue
-            if query and query not in f'{row.source} {row.text} {row.format} {row.status}'.casefold():
+            if query and query not in f'{row.source} {row.text} {row.format} {row.status} {row.printed_table} {row.actual_table} {row.table_id} {row.table_check}'.casefold():
                 continue
-            self.table.insert('', 'end', iid=str(index), values=(Path(row.source).name, row.page, row.status, row.format, row.text))
+            tag = 'match' if row.table_check == '一致' else ('mismatch' if row.table_check == '不一致' else 'pending')
+            self.table.insert('', 'end', iid=str(index), values=(Path(row.source).name, row.page, row.printed_table or '未读到', row.actual_table or '未取得', row.table_check, row.text, row.table_id, row.status, row.format), tags=(tag,))
 
     def details(self, _=None):
         selected = self.table.selection()
@@ -241,7 +267,7 @@ class App(tk.Tk):
             if url:
                 self.open_button.configure(state='normal')
             hint = '网址二维码 · 点击「打开网页」或双击此行查看网页内容' if url else f'位置：{row.position}'
-            self.detail.insert('end', f'{row.source} · 第 {row.page} 页\n{row.text}\n{hint}')
+            self.detail.insert('end', f'{row.source} · 第 {row.page} 页\n印刷：{row.printed_table or "未读到"} / 实际：{row.actual_table or "未取得"} / {row.table_check}\n依据：{row.table_evidence or "没有独立台号依据，内部 ID 不代表实际台号"}\n{row.text}\n{hint}')
         self.detail.configure(state='disabled')
 
     def open_clicked_webpage(self, event):
@@ -270,6 +296,22 @@ class App(tk.Tk):
         if selected:
             self.clipboard_clear()
             self.clipboard_append('\n'.join(self.results[int(i)].text for i in selected))
+
+    def import_reference(self):
+        path = filedialog.askopenfilename(title='选择独立的实际台号清单（不要用待检查图片自行生成）', filetypes=[('CSV 台号清单', '*.csv')])
+        if not path:
+            return
+        try:
+            reference = load_reference(path)
+        except (OSError, ValueError, csv.Error) as exc:
+            messagebox.showerror('导入失败', str(exc))
+            return
+        self.reference = reference
+        self.reference_label.set(f'已载入 {len(reference)} 条独立对照')
+        for row in self.results:
+            apply_reference(row, self.reference)
+        self.refresh()
+        self.status.set('已按独立清单重新核对，未覆盖的二维码保持待核实')
 
     def export(self):
         if not self.results:

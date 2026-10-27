@@ -48,7 +48,7 @@ class App(tk.Tk):
         toolbar = ttk.Frame(self, padding=(20, 16))
         toolbar.pack(fill='x')
         self.mutable = []
-        for label, command in [('添加文件', self.add_files), ('添加文件夹', self.add_folder), ('粘贴截图', self.paste_image), ('清空任务', self.clear)]:
+        for label, command in [('添加文件', self.add_files), ('粘贴截图', self.paste_image), ('清空任务', self.clear)]:
             button = ttk.Button(toolbar, text=label, command=command)
             button.pack(side='left', padx=(0, 8))
             self.mutable.append(button)
@@ -78,41 +78,26 @@ class App(tk.Tk):
         self.file_path = tk.StringVar(value='添加后会显示文件名、路径和预览')
         ttk.Label(left, textvariable=self.file_path, wraplength=245).pack(anchor='w', pady=(0, 10))
         self.audit_mode = tk.BooleanVar(value=True)
-        self.audit_toggle = ttk.Checkbutton(left, text='识别码上方的印刷台号', variable=self.audit_mode)
-        self.audit_toggle.pack(anchor='w', pady=(0, 8))
-        self.mutable.append(self.audit_toggle)
-        advanced = ttk.Frame(left)
-        def toggle_advanced():
-            if advanced.winfo_manager():
-                advanced.pack_forget()
-                advanced_toggle.configure(text='展开后台原码 / CSV 对照设置')
-            else:
-                advanced.pack(fill='x', after=advanced_toggle)
-                advanced_toggle.configure(text='收起后台原码 / CSV 对照设置')
-        advanced_toggle = ttk.Button(left, text='展开后台原码 / CSV 对照设置', command=toggle_advanced)
-        advanced_toggle.pack(fill='x', pady=(0, 8))
-        self.mutable.append(advanced_toggle)
-        original_button = ttk.Button(advanced, text='导入后台原始码文件夹', command=self.import_original_folder, style='Accent.TButton')
-        original_button.pack(fill='x', pady=(0, 8))
-        self.mutable.append(original_button)
-        reference_button = ttk.Button(advanced, text='导入实际台号对照 CSV', command=self.import_reference)
-        reference_button.pack(fill='x', pady=(0, 8))
-        self.mutable.append(reference_button)
-        self.reference_label = tk.StringVar(value='未导入对照 · 实际台号待核实')
-        if self.reference:
-            self.reference_label.set(f'已记住 {len(self.reference)} 个实际台号')
-        ttk.Label(left, textvariable=self.reference_label, wraplength=240).pack(anchor='w', pady=(0, 8))
-        ttk.Label(left, text='一键扫描并实读：\n先本地识码，再提醒你手动准备笔记。\n首次遇到新系统，框选一次台号位置；\n确认后自动继续，请勿切换窗口。\nF8 停止；切走后可点「继续读取」。', wraplength=245, foreground='#315bdf').pack(anchor='w', pady=(0, 8))
-        self.profile_count = tk.StringVar(value=f'台号位置模板（{len(self.profile_store.profiles)}）')
-        profile_button = ttk.Button(left, textvariable=self.profile_count, command=self.manage_profiles)
-        profile_button.pack(fill='x', pady=(0, 8))
-        self.mutable.append(profile_button)
+        self.reference_label = tk.StringVar()
+        self.profile_count = tk.StringVar()
         self.content_tabs = ttk.Notebook(right)
         self.content_tabs.pack(fill='both', expand=True)
         self.preview_tab = ttk.Frame(self.content_tabs, padding=10)
         self.results_tab = ttk.Frame(self.content_tabs)
         self.content_tabs.add(self.preview_tab, text='已添加文件预览')
         self.content_tabs.add(self.results_tab, text='扫码核对结果')
+        self.guide_tab = ttk.Frame(self.content_tabs)
+        self.content_tabs.add(self.guide_tab, text='微信准备与操作引导')
+        from workflow_ui import PreparationDialog
+        guide_canvas = tk.Canvas(self.guide_tab, highlightthickness=0)
+        guide_scroll = ttk.Scrollbar(self.guide_tab, command=guide_canvas.yview)
+        guide_canvas.configure(yscrollcommand=guide_scroll.set)
+        guide_scroll.pack(side='right', fill='y')
+        guide_canvas.pack(side='left', fill='both', expand=True)
+        self.preparation_panel = PreparationDialog(guide_canvas, 0, self.begin_prepared_read, self.cancel_prepared_read)
+        guide_window = guide_canvas.create_window(0, 0, anchor='nw', window=self.preparation_panel)
+        self.preparation_panel.bind('<Configure>', lambda _: guide_canvas.configure(scrollregion=guide_canvas.bbox('all')))
+        guide_canvas.bind('<Configure>', lambda event: guide_canvas.itemconfigure(guide_window, width=event.width))
         self.preview_info = tk.StringVar(value='尚未添加文件')
         ttk.Label(self.preview_tab, textvariable=self.preview_info, wraplength=850).pack(anchor='w', pady=(0, 10))
         self.preview_canvas = tk.Canvas(self.preview_tab, background='#e7ebf2', highlightthickness=0)
@@ -163,7 +148,7 @@ class App(tk.Tk):
         ttk.Button(actions, text='导出全部 CSV / JSON', command=self.export).pack(side='right')
         footer = ttk.Frame(self, padding=20)
         footer.pack(side='bottom', fill='x', before=body)
-        self.status = tk.StringVar(value='就绪 · 添加文件、文件夹，或复制截图后点击「粘贴截图」')
+        self.status = tk.StringVar(value='就绪 · 添加文件，或复制截图后点击「粘贴截图」')
         ttk.Label(footer, textvariable=self.status, wraplength=1200).pack(anchor='w')
         self.progress = ttk.Progressbar(footer, mode='determinate')
         self.progress.pack(fill='x', pady=(10, 0))
@@ -267,6 +252,7 @@ class App(tk.Tk):
 
     def clear(self):
         self.pipeline_active = False
+        self.preparation_panel.disable()
         self.files.clear()
         self.results.clear()
         self.file_list.delete(0, 'end')
@@ -302,14 +288,20 @@ class App(tk.Tk):
         self.start()
 
     def show_preparation(self, count):
-        from workflow_ui import PreparationDialog
-        self.workflow_status.set('第 2 阶段：请手动准备微信空白笔记，此时可以切换窗口')
-        def ready():
-            self.workflow_status.set('开始自动读取：请勿切换窗口；首次位置引导弹出时请框出台号')
-            self.start_live()
-        def cancel():
-            self.workflow_status.set('已保留本地扫码结果，尚未开始微信读取')
-        return PreparationDialog(self, count, ready, cancel)
+        self.workflow_status.set('第 2 阶段：按主界面图示准备笔记，此时可以切换窗口')
+        self.preparation_panel.set_count(count)
+        self.content_tabs.select(self.guide_tab)
+        return self.preparation_panel
+
+    def begin_prepared_read(self):
+        self.preparation_panel.disable()
+        self.workflow_status.set('自动读取中：不要动鼠标、键盘或切换窗口；位置引导出现时请框选桌台号')
+        self.start_live()
+
+    def cancel_prepared_read(self):
+        self.preparation_panel.disable()
+        self.workflow_status.set('已保留本地扫码结果，尚未开始微信读取')
+        self.content_tabs.select(self.results_tab)
 
     def worker(self, files):
         try:

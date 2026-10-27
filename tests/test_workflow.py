@@ -11,10 +11,7 @@ def test_one_scan_button_waits_for_manual_preparation_then_reads(monkeypatch, de
     path = tmp_path / '桌牌.png'
     barcode('https://example.com/table/1').save(path)
     app.add([path])
-    preparation, calls = {}, []
-    class FakePreparation:
-        def __init__(self, parent, count, ready, cancel):
-            preparation.update(count=count, ready=ready, cancel=cancel)
+    calls = []
     class FakeReader:
         def __init__(self, *_):
             pass
@@ -25,17 +22,18 @@ def test_one_scan_button_waits_for_manual_preparation_then_reads(monkeypatch, de
         def read(self, text, sequence):
             calls.append(text)
             return LiveResult('A1', '系统')
-    monkeypatch.setattr('workflow_ui.PreparationDialog', FakePreparation)
     monkeypatch.setattr('wechat_reader.WeChatReader', FakeReader)
     app.start_button.invoke()
     deadline = time.monotonic() + 10
-    while not preparation and time.monotonic() < deadline:
+    while str(app.preparation_panel.ready_button['state']) != 'normal' and time.monotonic() < deadline:
         app.update()
         time.sleep(.02)
-    assert preparation['count'] == 1 and not app.running
+    assert '1 个' in app.preparation_panel.heading.get() and not app.running
+    assert app.content_tabs.select() == str(app.guide_tab)
+    assert not any(isinstance(w, __import__('tkinter').Toplevel) for w in app.winfo_children())
     assert not calls  # Switching windows to manually open a note is safe here.
     assert not hasattr(app, 'live_button')
-    preparation['ready']()
+    app.preparation_panel.ready_button.invoke()
     while app.running and time.monotonic() < deadline:
         app.update()
         time.sleep(.02)
@@ -46,11 +44,8 @@ def test_one_scan_button_waits_for_manual_preparation_then_reads(monkeypatch, de
 def test_cancel_preparation_preserves_scan_results(monkeypatch, desktop_app):
     app = desktop_app
     app.results = [Result('sheet.png', 1, '已识别', text='https://example.com/1')]
-    class CancelPreparation:
-        def __init__(self, parent, count, ready, cancel):
-            cancel()
-    monkeypatch.setattr('workflow_ui.PreparationDialog', CancelPreparation)
     app.show_preparation(1)
+    app.preparation_panel.cancel_button.invoke()
     assert app.results[0].text == 'https://example.com/1' and not app.running
 
 
@@ -71,3 +66,21 @@ def test_region_picker_confirms_exact_selected_region(desktop_app):
     dialog.confirm.invoke()
     assert len(results) == 1 and results[0].anchor == '桌号'
     assert results[0].rect == (.6, .35, .95, .5)
+
+
+def test_main_guide_has_images_and_removed_controls(desktop_app):
+    import tkinter as tk
+    from tkinter import ttk
+    app = desktop_app
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from descendants(child)
+    labels = [str(w.cget('text')) for w in descendants(app)
+              if isinstance(w, (ttk.Button, ttk.Checkbutton, ttk.Label, tk.Label))]
+    assert '添加文件夹' not in labels
+    assert '识别码上方的印刷台号' not in labels
+    assert not any('对照设置' in text or '台号位置模板' in text for text in labels)
+    assert len(app.preparation_panel.photos) == 2
+    assert any('不要动鼠标' in text and '框选' in text for text in labels)
+    assert not isinstance(app.preparation_panel, tk.Toplevel)

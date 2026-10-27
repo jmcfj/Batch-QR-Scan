@@ -6,26 +6,50 @@ from reading_profiles import (ReadingProfile, RegionReadError, selected_texts,
                               interpret_texts, read_ocr, value_kind, validate_rect)
 
 
-class PreparationDialog(tk.Toplevel):
+class PreparationDialog(ttk.Frame):
+    """Persistent main-window guide; no modal window or focus grab."""
     def __init__(self, parent, count, ready, cancel):
-        super().__init__(parent)
-        self.title('开始读取前，请准备微信')
-        self.transient(parent)
-        self.resizable(False, False)
-        body = ttk.Frame(self, padding=24)
-        body.pack(fill='both', expand=True)
-        ttk.Label(body, text=f'已识别 {count} 个网址桌台码', font=('Microsoft YaHei UI', 16, 'bold')).pack(anchor='w', pady=(0, 16))
-        ttk.Label(body, text='1. 请手动在电脑版微信点击「+ → 写笔记」，新建一个空白笔记。\n\n2. 准备好后返回这里，点击下方「笔记已准备，开始读取」。\n\n3. 首次遇到一个餐厅系统，会展示点餐页截图，请框出台号位置。\n   确认一次后会保存模板，后续同类页面自动读取。', justify='left').pack(anchor='w')
-        tk.Label(body, text='开始自动读取后，请勿切换窗口或操作鼠标、键盘。\n位置引导弹出时可以操作该引导；确认后请等待整批完成。\nF8 可停止。意外切走会暂停，可点击「继续读取」。', bg='#fff1ce', fg='#7a4700', justify='left', padx=12, pady=12).pack(fill='x', pady=18)
-        buttons = ttk.Frame(body)
-        buttons.pack(fill='x')
-        def finish(callback):
-            self.destroy()
-            callback()
-        ttk.Button(buttons, text='暂不读取，保留扫码结果', command=lambda: finish(cancel)).pack(side='left')
-        ttk.Button(buttons, text='笔记已准备，开始读取', style='Accent.TButton', command=lambda: finish(ready)).pack(side='right', padx=(14, 0))
-        self.protocol('WM_DELETE_WINDOW', lambda: finish(cancel))
-        self.grab_set()
+        super().__init__(parent, padding=16)
+        from pathlib import Path
+        from PIL import Image
+        self.heading = tk.StringVar(value='扫描完成后，请按以下图示准备微信')
+        ttk.Label(self, textvariable=self.heading, font=('Microsoft YaHei UI', 16, 'bold')).pack(anchor='w', pady=(0, 8))
+        illustrations = ttk.Frame(self)
+        illustrations.pack(fill='x')
+        self.photos = []
+        assets = Path(__file__).resolve().parent / 'assets'
+        for filename, caption in [
+            ('wechat-note-menu.png', '① 微信右上角「+」→「写笔记」'),
+            ('wechat-note-pin.png', '② 置顶空白笔记，再最小化微信主窗口')]:
+            column = ttk.Frame(illustrations)
+            column.pack(side='left', fill='both', expand=True, padx=8)
+            ttk.Label(column, text=caption, font=('Microsoft YaHei UI', 11, 'bold')).pack(anchor='w')
+            with Image.open(assets / filename) as source:
+                image = source.copy()
+            image.thumbnail((260, 140))
+            photo = ImageTk.PhotoImage(image, master=self)
+            self.photos.append(photo)
+            ttk.Label(column, image=photo).pack(anchor='w', pady=6)
+        ttk.Label(self, text='新建一个空白笔记后，最小化微信主窗口，只保留笔记窗口在当前桌面。\n笔记窗口顶部有图钉「置顶」按钮（如图红箭头），请点击置顶。\n准备期间可以切换窗口；完成后返回这里，点击下方开始读取。', wraplength=760, justify='left').pack(anchor='w', pady=6)
+        tk.Label(self, text='开始读取后：不要动鼠标、键盘，不要切换窗口！\n首次打开某个餐厅的小程序时，请在位置引导中框选「桌台号」所在区域。\n仅框选时可以操作鼠标；确认后自动沿用该位置，直到整批完成。\nF8 停止；意外切换窗口会暂停，可点「继续读取」。', bg='#fff1ce', fg='#7a4700', font=('Microsoft YaHei UI', 11, 'bold'), justify='left', anchor='w', padx=12, pady=6).pack(fill='x', pady=6)
+        actions = ttk.Frame(self)
+        actions.pack(fill='x')
+        self.cancel_button = ttk.Button(actions, text='暂不读取，查看扫码结果', command=cancel)
+        self.cancel_button.pack(side='left')
+        self.ready_button = ttk.Button(actions, text='笔记已置顶、微信已最小化，开始读取', command=ready, style='Accent.TButton')
+        self.ready_button.pack(side='right')
+        self.disable()
+        if count:
+            self.set_count(count)
+
+    def set_count(self, count):
+        self.heading.set(f'已识别 {count} 个网址桌台码 · 请先完成微信准备')
+        self.ready_button.configure(state='normal')
+        self.cancel_button.configure(state='normal')
+
+    def disable(self):
+        self.ready_button.configure(state='disabled')
+        self.cancel_button.configure(state='disabled')
 
 
 class RegionPicker(tk.Toplevel):
